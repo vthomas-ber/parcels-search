@@ -18,13 +18,26 @@ class MasterDataHunter
 
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
+    
+    # 3. Market Language Logic (Special Handling for BE)
     @country_langs = {
-      "DE" => "German", "AT" => "German", "CH" => "German",
-      "UK" => "English", "GB" => "English", "FR" => "French",
-      "BE" => "French", "IT" => "Italian", "ES" => "Spanish",
-      "NL" => "Dutch", "DK" => "Danish", "SE" => "Swedish",
-      "NO" => "Norwegian", "PL" => "Polish", "PT" => "Portuguese"
+      "DE" => "German", 
+      "AT" => "German", 
+      "CH" => "German",
+      "UK" => "English", 
+      "GB" => "English", 
+      "FR" => "French",
+      "IT" => "Italian", 
+      "ES" => "Spanish",
+      "NL" => "Dutch", 
+      "DK" => "Danish", 
+      "SE" => "Swedish",
+      "NO" => "Norwegian", 
+      "PL" => "Polish", 
+      "PT" => "Portuguese",
+      "BE" => "German, French, AND Dutch (Must provide all 3)" # <--- Trilingual Requirement
     }
+
     # 2. THE GOLDMINE (Trusted Retailers)
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:intermarche.com OR site:monoprix.fr",
@@ -72,6 +85,7 @@ class MasterDataHunter
     if needs_fallback?(ai_result)
       search_name = official_data ? official_data['name'] : ai_result["product_name"]
       
+      # Clean name for search
       if search_name && search_name.length > 3 && !search_name.include?("Webdaten")
         puts "🔄 Deep Search for: #{search_name}"
         name_urls = find_candidate_sources(search_name, market, :name)
@@ -89,12 +103,16 @@ class MasterDataHunter
       return empty_result(gtin, market, ai_result[:error], image_data ? image_data[:url] : nil)
     end
 
+    # Extract country from official data if available
+    origin_country = official_data ? official_data['issuingCountry'] : nil
+
     {
       found: true,
       gtin: gtin,
       status: ai_result["status"] || "Found",
       market: market,
       image_url: image_data ? image_data[:url] : nil,
+      issuing_country: origin_country, # <--- NEW FIELD: Origin
       **ai_result,
       defined_sources: confirmed_sources
     }
@@ -109,12 +127,10 @@ class MasterDataHunter
   def needs_fallback?(result)
     return true if result[:error]
     ing = result["ingredients"].to_s.downcase
-    nut = result["energy"].to_s.downcase
     
+    # Retry if ingredients are missing or strictly English "not found"
     missing_ing = ing.length < 10 || ing.include?("keine") || ing.include?("not found")
-    missing_nut = nut.include?("undefined") || nut.include?("keine") || nut.length < 2
-    
-    missing_ing || missing_nut
+    missing_ing
   end
 
   def fetch_official_ean_data(gtin)
@@ -187,7 +203,6 @@ class MasterDataHunter
               doc = Nokogiri::HTML(response.body)
               doc.css('script, style, nav, footer, iframe, header, .cookie').remove
               
-              # INCREASED LIMIT TO 12,000 CHARS (Was 2,500)
               txt = doc.text.gsub(/\s+/, " ").strip[0..12000]
               
               json = ""
@@ -206,9 +221,9 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, text_data, official, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    official_txt = official ? "OFFICIAL REGISTRY IDENTITY: #{official['name']} (#{official['categoryName']})" : "OFFICIAL REGISTRY: None"
+    official_txt = official ? "OFFICIAL REGISTRY IDENTITY: #{official['name']}" : "OFFICIAL REGISTRY: None"
 
-    # STRICT TRANSLATION PROMPT
+    # --- NEW PROMPT LOGIC ---
     prompt = <<~TEXT
       You are a Food Data Expert.
       #{official_txt}
@@ -217,18 +232,29 @@ class MasterDataHunter
       #{text_data}
       #{base64_image ? "IMAGE: Yes" : "IMAGE: No"}
 
-      TASK: 
-      1. Synthesize all data. 
-      2. NAME HANDLING: Use the Official Registry Identity if available, BUT YOU MUST TRANSLATE IT into #{target_lang}. Do NOT output the raw name if it is in a different language.
-      3. INGREDIENTS/ALLERGENS: Must be in #{target_lang}.
-      4. OUTPUT JSON:
+      MARKET REQUIREMENTS:
+      - Target Market: #{market}
+      - Target Languages: #{target_lang}
+      
+      TASK:
+      1. Synthesize all data.
+      2. **PRODUCT NAME:** If an Official Registry name exists, use it as the base, BUT YOU MUST TRANSLATE IT to the primary language of the market (e.g., German for DE, French for BE).
+      3. **BRAND:** Extract the Brand Name.
+      4. **BELGIUM (BE) SPECIAL RULE:** If Market is 'BE', output Ingredients, Allergens, and 'May Contain' in THREE languages: German, French, and Dutch. Separate them clearly with line breaks.
+      5. **NET WEIGHT:** Extract net weight (e.g. 200g, 500ml).
+      6. **MAY CONTAIN:** Extract 'May contain' / traces info.
+
+      OUTPUT JSON (Strictly this schema):
       {
-        "product_name": "Name (Translated to #{target_lang})", 
-        "ingredients": "List (Translated to #{target_lang})", 
-        "allergens": "List (Translated)",
+        "brand": "Brand Name",
+        "product_name": "Name (Translated)", 
+        "net_weight": "Value",
+        "ingredients": "List (Translated/Trilingual for BE)", 
+        "allergens": "List (Translated/Trilingual for BE)",
+        "may_contain": "List (Translated/Trilingual for BE)",
         "nutri_scope": "100g/ml", "energy": "kJ/kcal", "fat": "val", "saturates": "val",
         "carbs": "val", "sugars": "val", "protein": "val", "fiber": "val", "salt": "val",
-        "organic_id": "Code", "sources_summary": "Short explanation (e.g. 'Nutri from Tesco')"
+        "organic_id": "Code", "sources_summary": "Short explanation"
       }
     TEXT
 
@@ -274,7 +300,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v2.4 (Fixes)</title>
+  <title>TGTG AI Hunter v2.5</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -287,7 +313,7 @@ __END__
     button:disabled { background: #ccc; cursor: not-allowed; }
 
     .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #e1e4e8; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2600px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 3200px; } /* Increased width for new columns */
     th { text-align: left; background: #00816A; color: white; padding: 14px 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; font-weight: 600; letter-spacing: 0.5px; }
     td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 300px; line-height: 1.4; }
     tr:nth-child(even) { background: #f8f9fa; }
@@ -317,7 +343,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.4 (Fixes)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.5 (Trilingual BE + Full Specs)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -350,22 +376,24 @@ __END__
       <thead>
         <tr>
           <th>Status</th>
-          <th>Image</th>
           <th>EAN</th>
+          <th>Brand</th>
           <th>Product Name</th>
-          <th>Sources (Clickable)</th>
+          <th>Origin</th> <th>Sources</th>
+          <th>Net Weight</th>
+          <th>Organic ID</th>
           <th>Ingredients</th>
           <th>Allergens</th>
+          <th>May Contain</th>
           <th>Nutri Scope</th>
           <th>Energy</th>
           <th>Fat</th>
           <th>Saturates</th>
           <th>Carbs</th>
           <th>Sugars</th>
-          <th>Protein</th>
           <th>Fiber</th>
+          <th>Protein</th>
           <th>Salt</th>
-          <th>Organic ID</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -394,7 +422,7 @@ __END__
 
     for (const gtin of lines) {
       const tr = document.createElement('tr');
-      let emptyCells = ""; for(let i=0; i<14; i++) { emptyCells += "<td></td>"; }
+      let emptyCells = ""; for(let i=0; i<18; i++) { emptyCells += "<td></td>"; }
       tr.innerHTML = `<td><span class="status-badge" style="background:#eee; color:#666;">...</span></td>` + emptyCells;
       tbody.appendChild(tr);
 
@@ -406,47 +434,49 @@ __END__
         if (data.status.includes("Deep")) sClass = 'st-deep';
         if (data.status.includes("Error") || data.status.includes("Missing")) sClass = 'st-miss';
 
-        const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>` : '-';
-        
         let sourcesHTML = `<div class="source-list">`;
         if (data.sources_summary) sourcesHTML += `<span class="ai-note">${data.sources_summary}</span>`;
-        
         if (data.defined_sources && data.defined_sources.length > 0) {
            data.defined_sources.forEach(src => {
               let icon = "🔗";
               let cssClass = "src-web";
               if(src.type === 'registry') { icon = "🏛️"; cssClass = "src-registry"; }
               if(src.type === 'image')    { icon = "📸"; cssClass = "src-img"; }
-              
               sourcesHTML += `<a href="${src.url}" target="_blank" class="src-btn ${cssClass}">${icon} ${src.title}</a>`;
            });
         } else {
            sourcesHTML += `<span style="font-size:11px; color:#999;">No links</span>`;
         }
         sourcesHTML += `</div>`;
+        
+        // Format Trilingual text nicely for display (Newlines to <br>)
+        const fmt = (text) => (text || "-").replace(/\n/g, "<br>");
 
         tr.innerHTML = `
           <td><span class="status-badge ${sClass}">${data.status}</span></td>
-          <td>${imgHTML}</td>
           <td>${gtin}</td>
+          <td>${data.brand || '-'}</td>
           <td style="font-weight:bold;">${data.product_name || '-'}</td>
+          <td style="text-align:center;">${data.issuing_country || '-'}</td>
           <td>${sourcesHTML}</td>
-          <td>${data.ingredients || '-'}</td>
-          <td>${data.allergens || '-'}</td>
+          <td>${data.net_weight || '-'}</td>
+          <td>${data.organic_id || '-'}</td>
+          <td style="font-size:11px;">${fmt(data.ingredients)}</td>
+          <td style="font-size:11px;">${fmt(data.allergens)}</td>
+          <td style="font-size:11px;">${fmt(data.may_contain)}</td>
           <td>${data.nutri_scope || '-'}</td>
           <td>${data.energy || '-'}</td>
           <td>${data.fat || '-'}</td>
           <td>${data.saturates || '-'}</td>
           <td>${data.carbs || '-'}</td>
           <td>${data.sugars || '-'}</td>
-          <td>${data.protein || '-'}</td>
           <td>${data.fiber || '-'}</td>
+          <td>${data.protein || '-'}</td>
           <td>${data.salt || '-'}</td>
-          <td>${data.organic_id || '-'}</td>
         `;
         resultsData.push(data);
       } catch (e) {
-        tr.innerHTML = `<td colspan="17" style="color:red; text-align:center;">Network/Server Error for ${gtin}</td>`;
+        tr.innerHTML = `<td colspan="19" style="color:red; text-align:center;">Network/Server Error for ${gtin}</td>`;
       }
       processed++;
       updateProgress();
@@ -458,19 +488,21 @@ __END__
   }
 
   function downloadCSV() {
-    let csv = "EAN,ProductName,Status,Ingredients,Allergens,Energy,Fat,Carbs,Sugars,Protein,Salt,SourcesList\n";
+    let csv = "Status,EAN,Brand,ProductName,Origin,Sources,NetWeight,OrganicID,Ingredients,Allergens,MayContain,NutriScope,Energy,Fat,Saturates,Carbs,Sugars,Fiber,Protein,Salt\n";
     resultsData.forEach(row => {
-      const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " ").trim();
+      const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " | ").trim();
       
       let srcList = "";
       if(row.defined_sources) {
          srcList = row.defined_sources.map(s => `[${s.type.toUpperCase()}: ${s.url}]`).join(" | ");
       }
 
-      csv += `${row.gtin},${clean(row.product_name)},${row.status},` +
-             `${clean(row.ingredients)},${clean(row.allergens)},${clean(row.energy)},` +
-             `${clean(row.fat)},${clean(row.carbs)},${clean(row.sugars)},${clean(row.protein)},` +
-             `${clean(row.salt)},${srcList}\n`;
+      csv += `${row.status},${row.gtin},${clean(row.brand)},${clean(row.product_name)},${clean(row.issuing_country)},` +
+             `${srcList},${clean(row.net_weight)},${clean(row.organic_id)},` +
+             `${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},` +
+             `${clean(row.nutri_scope)},${clean(row.energy)},${clean(row.fat)},` +
+             `${clean(row.saturates)},${clean(row.carbs)},${clean(row.sugars)},` +
+             `${clean(row.fiber)},${clean(row.protein)},${clean(row.salt)}\n`;
     });
     
     const link = document.createElement("a");
