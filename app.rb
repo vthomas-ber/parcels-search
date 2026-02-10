@@ -25,13 +25,14 @@ class MasterDataHunter
       "NL" => "Dutch", "DK" => "Danish", "SE" => "Swedish",
       "NO" => "Norwegian", "PL" => "Polish", "PT" => "Portuguese"
     }
+    # 2. THE GOLDMINE (Trusted Retailers)
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:intermarche.com OR site:monoprix.fr",
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com OR site:waitrose.com",
       "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:dirk.nl",
       "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be OR site:ah.be",
       "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:dm.de OR site:rossmann.de",
-      "AT" => "site:billa.at OR site:spar.at OR site:hofer.at OR site:unimarkt.at OR site:gurkerl.at", # <--- NEW: Austria
+      "AT" => "site:billa.at OR site:spar.at OR site:hofer.at OR site:unimarkt.at OR site:gurkerl.at",
       "DK" => "site:nemlig.com OR site:bilkatogo.dk OR site:rema1000.dk OR site:netto.dk",
       "IT" => "site:carrefour.it OR site:conad.it OR site:esselunga.it OR site:coop.it",
       "ES" => "site:carrefour.es OR site:mercadona.es OR site:dia.es OR site:alcampo.es",
@@ -45,7 +46,6 @@ class MasterDataHunter
   def process_product(gtin, market)
     return { found: false, status: "Missing GEMINI_API_KEY" } if GEMINI_API_KEY.nil? || GEMINI_API_KEY.empty?
 
-    # TRACKER: We will store every valid source here
     confirmed_sources = []
 
     # 1. OFFICIAL REGISTRY
@@ -63,7 +63,6 @@ class MasterDataHunter
     # 3. WEB HUNT (Standard)
     candidate_urls = find_candidate_sources(gtin, market, :ean)
     web_data = fetch_multi_page_data(candidate_urls)
-    # Append successful web links to tracker
     web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
 
     # 4. FIRST ANALYSIS
@@ -78,10 +77,8 @@ class MasterDataHunter
         name_urls = find_candidate_sources(search_name, market, :name)
         fallback_data = fetch_multi_page_data(name_urls)
         
-        # Add new valid links
         fallback_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
 
-        # Re-run AI with combined context
         full_context = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH ===\n" + fallback_data[:text]
         ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, full_context, official_data, gtin, market)
         ai_result["status"] = "Deep Search (Found)"
@@ -99,7 +96,7 @@ class MasterDataHunter
       market: market,
       image_url: image_data ? image_data[:url] : nil,
       **ai_result,
-      defined_sources: confirmed_sources # <--- Explicit Source List
+      defined_sources: confirmed_sources
     }
   end
 
@@ -133,9 +130,7 @@ class MasterDataHunter
     return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = (market == "UK" ? "gb" : market.downcase)
     
-    # 1. Barcode specific sites
     res = GoogleSearch.new(q: "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
-    # 2. Fallback
     if (res[:images_results] || []).empty?
       res = GoogleSearch.new(q: "#{gtin} -site:openfoodfacts.org", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
     end
@@ -160,13 +155,11 @@ class MasterDataHunter
     candidates = []
 
     if type == :ean && goldmine
-      # Retailer Search
       res = GoogleSearch.new(q: "#{goldmine} #{query} #{bans}", gl: gl, num: 5, api_key: SERPAPI_KEY).get_hash
       (res[:organic_results] || []).each { |r| candidates << r[:link] }
     end
 
     if candidates.empty? || type == :name
-      # Broad Search
       q_str = "#{query} ingredients nutrition #{bans}"
       res = GoogleSearch.new(q: q_str, gl: gl, num: 5, api_key: SERPAPI_KEY).get_hash
       (res[:organic_results] || []).each { |r| candidates << r[:link] }
@@ -175,7 +168,6 @@ class MasterDataHunter
     candidates.uniq.first(4)
   end
 
-  # UPDATED: Returns both text AND the list of valid URLs
   def fetch_multi_page_data(urls)
     return { text: "", valid_urls: [] } if urls.empty?
 
@@ -186,20 +178,20 @@ class MasterDataHunter
     urls.each_with_index do |url, index|
       threads << Thread.new do
         begin
-          Timeout.timeout(6) do
+          Timeout.timeout(7) do
             agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 5)
+            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 6)
             
             if response.code == 200
-              # Track valid URL
               valid_urls << url
-              
               doc = Nokogiri::HTML(response.body)
               doc.css('script, style, nav, footer, iframe, header, .cookie').remove
               
-              txt = doc.text.gsub(/\s+/, " ").strip[0..2500]
+              # INCREASED LIMIT TO 12,000 CHARS (Was 2,500)
+              txt = doc.text.gsub(/\s+/, " ").strip[0..12000]
+              
               json = ""
-              doc.css('script[type="application/ld+json"]').each { |s| json += s.content.to_s.gsub(/\s+/, " ").strip[0..1500] + " " }
+              doc.css('script[type="application/ld+json"]').each { |s| json += s.content.to_s.gsub(/\s+/, " ").strip[0..4000] + " " }
               
               results_text << "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json}\n\n"
             end
@@ -214,8 +206,9 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, text_data, official, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    official_txt = official ? "OFFICIAL REGISTRY: #{official['name']} (#{official['categoryName']})" : "OFFICIAL REGISTRY: None"
+    official_txt = official ? "OFFICIAL REGISTRY IDENTITY: #{official['name']} (#{official['categoryName']})" : "OFFICIAL REGISTRY: None"
 
+    # STRICT TRANSLATION PROMPT
     prompt = <<~TEXT
       You are a Food Data Expert.
       #{official_txt}
@@ -225,11 +218,14 @@ class MasterDataHunter
       #{base64_image ? "IMAGE: Yes" : "IMAGE: No"}
 
       TASK: 
-      1. Synthesize all data. Trust Registry for Name. Trust Web/Image for Nutri/Ingredients.
-      2. TRANSLATE everything to #{target_lang}.
-      3. OUTPUT JSON:
+      1. Synthesize all data. 
+      2. NAME HANDLING: Use the Official Registry Identity if available, BUT YOU MUST TRANSLATE IT into #{target_lang}. Do NOT output the raw name if it is in a different language.
+      3. INGREDIENTS/ALLERGENS: Must be in #{target_lang}.
+      4. OUTPUT JSON:
       {
-        "product_name": "Name", "ingredients": "List", "allergens": "List",
+        "product_name": "Name (Translated to #{target_lang})", 
+        "ingredients": "List (Translated to #{target_lang})", 
+        "allergens": "List (Translated)",
         "nutri_scope": "100g/ml", "energy": "kJ/kcal", "fat": "val", "saturates": "val",
         "carbs": "val", "sugars": "val", "protein": "val", "fiber": "val", "salt": "val",
         "organic_id": "Code", "sources_summary": "Short explanation (e.g. 'Nutri from Tesco')"
@@ -278,20 +274,18 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v2.3</title>
+  <title>TGTG AI Hunter v2.4 (Fixes)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
     h1 { color: #00816A; margin-bottom: 20px; }
     
-    /* Controls */
     .controls { display: flex; gap: 15px; margin-bottom: 20px; background: #eefcf9; padding: 20px; border-radius: 8px; border: 1px solid #ccece6; }
     textarea { width: 100%; height: 100px; padding: 12px; border: 1px solid #ddd; border-radius: 6px; font-family: monospace; font-size: 14px; }
     button { background: #00816A; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
     button:hover { background: #006653; }
     button:disabled { background: #ccc; cursor: not-allowed; }
 
-    /* Table */
     .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #e1e4e8; border-radius: 8px; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 2600px; }
     th { text-align: left; background: #00816A; color: white; padding: 14px 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; font-weight: 600; letter-spacing: 0.5px; }
@@ -299,16 +293,12 @@ __END__
     tr:nth-child(even) { background: #f8f9fa; }
     tr:hover { background: #f1f3f5; }
 
-    /* Status Badges */
     .status-badge { padding: 4px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; text-transform: uppercase; }
     .st-found { background: #d4edda; color: #155724; }
     .st-deep { background: #cce5ff; color: #004085; }
     .st-miss { background: #f8d7da; color: #721c24; }
-
-    /* Image */
     .img-thumb { width: 50px; height: 50px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; padding: 2px; }
 
-    /* Source Pills */
     .source-list { display: flex; flex-direction: column; gap: 4px; }
     .src-btn { 
       display: inline-flex; align-items: center; gap: 5px; 
@@ -320,7 +310,6 @@ __END__
     .src-registry { border-left: 3px solid #00816A; }
     .src-web { border-left: 3px solid #007bff; }
     .src-img { border-left: 3px solid #6f42c1; }
-
     .ai-note { font-size: 10px; color: #888; margin-bottom: 5px; font-style: italic; }
   </style>
 </head>
@@ -328,7 +317,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.3 (Transparent Sources)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.4 (Fixes)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -340,16 +329,16 @@ __END__
     <div style="width: 200px;">
        <label style="font-weight:bold; display:block; margin-bottom:5px;">Market:</label>
        <select id="marketSelect" style="width:100%; padding:10px; border-radius:6px; border:1px solid #ddd;">
-        <option value="DE">Germany (DE)</option>
-        <option value="DE">Austria (AT)</option>
-        <option value="UK">United Kingdom (UK)</option>
-        <option value="FR">France (FR)</option>
-        <option value="NL">Netherlands (NL)</option>
         <option value="BE">Belgium (BE)</option>
+        <option value="DK">Denmark (DK)</option>
+        <option value="DE">Germany (DE)</option>
+        <option value="AT">Austria (AT)</option>
+        <option value="NL">Netherlands (NL)</option>
+        <option value="FR">France (FR)</option>
         <option value="IT">Italy (IT)</option>
         <option value="ES">Spain (ES)</option>
-        <option value="DK">Denmark (DK)</option>
-        <option value="DE">Poland (PL)</option>
+        <option value="UK">United Kingdom (UK)</option>
+        <option value="PL">Poland (PL)</option>
       </select>
       <button id="startBtn" onclick="startBatch()" style="width:100%; margin-top:10px;">🚀 Analyze</button>
       <button id="downloadBtn" onclick="downloadCSV()" style="width:100%; margin-top:5px; background:#343a40; display:none;">⬇️ CSV</button>
@@ -364,7 +353,8 @@ __END__
           <th>Image</th>
           <th>EAN</th>
           <th>Product Name</th>
-          <th>Sources (Clickable)</th> <th>Ingredients</th>
+          <th>Sources (Clickable)</th>
+          <th>Ingredients</th>
           <th>Allergens</th>
           <th>Nutri Scope</th>
           <th>Energy</th>
@@ -412,15 +402,12 @@ __END__
         const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
         const data = await response.json();
 
-        // Status Logic
         let sClass = 'st-found';
         if (data.status.includes("Deep")) sClass = 'st-deep';
         if (data.status.includes("Error") || data.status.includes("Missing")) sClass = 'st-miss';
 
-        // Image Logic
         const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>` : '-';
         
-        // --- NEW SOURCE LOGIC ---
         let sourcesHTML = `<div class="source-list">`;
         if (data.sources_summary) sourcesHTML += `<span class="ai-note">${data.sources_summary}</span>`;
         
@@ -437,7 +424,6 @@ __END__
            sourcesHTML += `<span style="font-size:11px; color:#999;">No links</span>`;
         }
         sourcesHTML += `</div>`;
-        // ------------------------
 
         tr.innerHTML = `
           <td><span class="status-badge ${sClass}">${data.status}</span></td>
@@ -476,7 +462,6 @@ __END__
     resultsData.forEach(row => {
       const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " ").trim();
       
-      // Flatten sources for CSV
       let srcList = "";
       if(row.defined_sources) {
          srcList = row.defined_sources.map(s => `[${s.type.toUpperCase()}: ${s.url}]`).join(" | ");
