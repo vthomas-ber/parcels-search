@@ -56,7 +56,7 @@ class MasterDataHunter
     }
   end
 
-def process_product(gtin, market)
+  def process_product(gtin, market)
     return { found: false, status: "Missing GEMINI_API_KEY" } if GEMINI_API_KEY.nil? || GEMINI_API_KEY.empty?
 
     confirmed_sources = []
@@ -81,48 +81,23 @@ def process_product(gtin, market)
     # 4. FIRST ANALYSIS
     ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, web_data[:text], official_data, gtin, market)
 
-    # 5. DEEP SEARCH CHECK (The Fix)
-    # We check if ingredients are missing in the FIRST result.
-    # If they are missing (even if we had an image), we MUST try the Name Search.
+    # 5. DEEP SEARCH FALLBACK (Name-Based)
     if needs_fallback?(ai_result)
       search_name = official_data ? official_data['name'] : ai_result["product_name"]
       
-      # Clean name and ensure it's valid
+      # Clean name for search
       if search_name && search_name.length > 3 && !search_name.include?("Webdaten")
-        puts "🔄 Deep Search Triggered for: #{search_name}"
-        
-        # SEARCH BY NAME
+        puts "🔄 Deep Search for: #{search_name}"
         name_urls = find_candidate_sources(search_name, market, :name)
         fallback_data = fetch_multi_page_data(name_urls)
         
-        # Add new sources
         fallback_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
 
-        # Combine EVERYTHING: Old Text + New Name Text
-        full_context = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_data[:text]
-        
-        # Re-run AI
+        full_context = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH ===\n" + fallback_data[:text]
         ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, full_context, official_data, gtin, market)
         ai_result["status"] = "Deep Search (Found)"
       end
     end
-
-    if ai_result[:error]
-      return empty_result(gtin, market, ai_result[:error], image_data ? image_data[:url] : nil)
-    end
-
-    origin_country = official_data ? official_data['issuingCountry'] : nil
-
-    {
-      found: true,
-      gtin: gtin,
-      status: ai_result["status"] || "Found",
-      market: market,
-      image_url: image_data ? image_data[:url] : nil,
-      issuing_country: origin_country,
-      **ai_result,
-      defined_sources: confirmed_sources
-    }
 
     if ai_result[:error]
       return empty_result(gtin, market, ai_result[:error], image_data ? image_data[:url] : nil)
@@ -193,7 +168,7 @@ def process_product(gtin, market)
     gl = (market == "UK" ? "gb" : market.downcase)
     goldmine = @goldmine_sites[market]
     
-    # --- CHANGE 1: UNBAN AMAZON, BAN TIKTOK ---
+    # --- BANS: TikTok Banned, Amazon Unbanned ---
     bans = "-site:openfoodfacts.org -site:wikipedia.org -site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
     candidates = []
 
@@ -250,7 +225,6 @@ def process_product(gtin, market)
     
     official_txt = official ? "OFFICIAL REGISTRY IDENTITY: #{official['name']}" : "OFFICIAL REGISTRY: None"
 
-    # --- CHANGE 2: PROMPT TWEAK FOR GARBAGE AVOIDANCE ---
     prompt = <<~TEXT
       You are a Food Data Expert.
       #{official_txt}
@@ -265,7 +239,7 @@ def process_product(gtin, market)
       
       TASK:
       1. Synthesize all data.
-      2. **PRIORITY RULE:** If the Text Data contains social media noise, irrelevant comments, or "Login" prompts, IGNORE IT and rely on the Image or Official Registry.
+      2. **PRIORITY RULE:** If Text Data contains social media noise (TikTok/Instagram), IGNORE IT. Trust the Image or Registry.
       3. **PRODUCT NAME:** If an Official Registry name exists, use it as the base, BUT YOU MUST TRANSLATE IT to the primary language of the market (e.g., German for DE, French for BE).
       4. **BRAND:** Extract the Brand Name.
       5. **BELGIUM (BE) SPECIAL RULE:** If Market is 'BE', output Ingredients, Allergens, and 'May Contain' in THREE languages: German, French, and Dutch. Separate them clearly with line breaks.
@@ -328,7 +302,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v2.7</title>
+  <title>TGTG AI Hunter v2.8</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -371,7 +345,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.7 (Restoring the "HailMary")</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.8 (Hail Mary Fixed)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
