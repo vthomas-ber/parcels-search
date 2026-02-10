@@ -123,7 +123,6 @@ def process_product(gtin, market)
       **ai_result,
       defined_sources: confirmed_sources
     }
-  end
 
     if ai_result[:error]
       return empty_result(gtin, market, ai_result[:error], image_data ? image_data[:url] : nil)
