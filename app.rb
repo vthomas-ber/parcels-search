@@ -11,7 +11,7 @@ require 'timeout'
 # --- CONFIGURATION ---
 GEMINI_API_KEY     = ENV['GEMINI_API_KEY']
 SERPAPI_KEY        = ENV['SERPAPI_KEY']
-EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN'] # <--- Your new API Key goes here!
+EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN']
 
 class MasterDataHunter
   include HTTParty
@@ -50,27 +50,46 @@ class MasterDataHunter
       return { found: false, status: "Missing GEMINI_API_KEY" }
     end
 
-    # A. OFFICIAL REGISTRY CHECK (New! Uses your API Key)
+    # STEP A: OFFICIAL REGISTRY CHECK (The Anchor)
     official_data = fetch_official_ean_data(gtin)
-
-    # B. IMAGE HUNT
+    
+    # STEP B: IMAGE HUNT
     image_data = find_best_image(gtin, market)
 
-    # C. MULTI-SOURCE DATA HUNT
-    candidate_urls = find_candidate_sources(gtin, market)
-
-    # D. PARALLEL FETCH
+    # STEP C: EAN-BASED WEB HUNT
+    candidate_urls = find_candidate_sources(gtin, market, :ean)
     combined_content = fetch_multi_page_data(candidate_urls)
 
-    # E. ANALYZE (With Official Data injection)
+    # STEP D: FIRST ANALYSIS
     ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, combined_content, official_data, gtin, market)
 
-    # F. FALLBACK
-    if ai_result.is_a?(Hash) && ai_result[:error] && ai_result[:error].include?("API 400")
-      puts "⚠️ Image rejected. Retrying TEXT ONLY..."
-      ai_result = analyze_with_gemini(nil, combined_content, official_data, gtin, market)
+    # --- NEW: STEP E: INTELLIGENT FALLBACK (Name-Based Search) ---
+    # If ingredients are missing/short, AND we have a valid name, TRY AGAIN.
+    if needs_fallback?(ai_result)
+      
+      # Determine best name to search: Official > AI Result > Generic
+      search_name = official_data ? official_data['name'] : ai_result["product_name"]
+      
+      if search_name && search_name.length > 3 && !search_name.include?("Webdaten")
+        puts "🔄 Fallback triggered: Searching for '#{search_name}'..."
+        
+        # 1. Search by Name
+        name_urls = find_candidate_sources(search_name, market, :name)
+        
+        # 2. Fetch New Content
+        fallback_content = fetch_multi_page_data(name_urls)
+        
+        # 3. Re-Analyze with BOTH old EAN content and new Name content
+        # We append the new content to the old to give AI maximum context
+        full_context = combined_content + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_content
+        
+        # 4. Run AI Again
+        ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, full_context, official_data, gtin, market)
+        ai_result["status"] = "Deep Search (Found)" # Update status so user knows we worked hard
+      end
     end
 
+    # Handle Errors
     if ai_result.is_a?(Hash) && ai_result[:error]
       return empty_result(gtin, market, ai_result[:error], image_data ? image_data[:url] : nil)
     end
@@ -78,7 +97,7 @@ class MasterDataHunter
     {
       found: true,
       gtin: gtin,
-      status: "Found",
+      status: ai_result["status"] || "Found",
       market: market,
       image_url: image_data ? image_data[:url] : nil,
       **ai_result
@@ -87,10 +106,22 @@ class MasterDataHunter
 
   private
 
-  # NEW: Connects to ean-search.org API
+  # Check if the result is "bad" enough to warrant a second search
+  def needs_fallback?(result)
+    return true if result[:error] # If it failed, retry
+    
+    ing = result["ingredients"].to_s.downcase
+    nut = result["energy"].to_s.downcase
+    
+    # Retry if ingredients are missing, "unknown", or "no data"
+    missing_ingredients = ing.length < 10 || ing.include?("keine") || ing.include?("not found") || ing.include?("unavailable")
+    missing_nutrition = nut.include?("undefined") || nut.include?("keine") || nut.length < 2
+
+    missing_ingredients || missing_nutrition
+  end
+
   def fetch_official_ean_data(gtin)
     return nil if EAN_SEARCH_TOKEN.nil? || EAN_SEARCH_TOKEN.empty?
-    
     begin
       url = "https://api.ean-search.org/api?token=#{EAN_SEARCH_TOKEN}&op=barcode-lookup&format=json&ean=#{gtin}"
       response = HTTParty.get(url, timeout: 5)
@@ -135,25 +166,35 @@ class MasterDataHunter
     nil
   end
 
-  def find_candidate_sources(gtin, market)
+  # UPDATED: Handles both EAN and NAME searches
+  def find_candidate_sources(query_term, market, type = :ean)
     return [] if SERPAPI_KEY.nil? || SERPAPI_KEY.strip.empty?
 
     candidates = []
     gl = serp_gl_for_market(market)
     goldmine = @goldmine_sites[market]
-    bans = "-site:openfoodfacts.org -site:wikipedia.org -site:amazon.* -site:ebay.*"
+    bans = "-site:openfoodfacts.org -site:wikipedia.org -site:amazon.* -site:ebay.* -site:pinterest.*"
 
-    # 1. Retailer Search
-    if goldmine
-      puts "🔎 Searching Retailers for #{gtin}..."
-      res = GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 5, api_key: SERPAPI_KEY).get_hash
-      (res[:organic_results] || []).each { |r| candidates << r[:link] }
-    end
+    # Construct Query based on Type
+    if type == :ean
+      # Strategy A: Retailer EAN Search
+      if goldmine
+        res = GoogleSearch.new(q: "#{goldmine} #{query_term} #{bans}", gl: gl, num: 5, api_key: SERPAPI_KEY).get_hash
+        (res[:organic_results] || []).each { |r| candidates << r[:link] }
+      end
+      
+      # Strategy B: General EAN Search (if retailers fail)
+      if candidates.length < 2
+        res = GoogleSearch.new(q: "#{query_term} ingredients nutrition #{bans}", gl: gl, num: 5, api_key: SERPAPI_KEY).get_hash
+        (res[:organic_results] || []).each { |r| candidates << r[:link] }
+      end
 
-    # 2. General Search
-    if candidates.length < 3
-      puts "🔎 Searching Broad Web for #{gtin}..."
-      res = GoogleSearch.new(q: "#{gtin} ingredients nutrition #{bans}", gl: gl, num: 5, api_key: SERPAPI_KEY).get_hash
+    elsif type == :name
+      # Strategy C: Name Search (The Hail Mary)
+      # We append "ingredients" in the local language would be better, but English works often
+      q_string = "#{query_term} ingredients nutrition #{bans}"
+      puts "🔎 FALLBACK SEARCH: #{q_string}"
+      res = GoogleSearch.new(q: q_string, gl: gl, num: 5, api_key: SERPAPI_KEY).get_hash
       (res[:organic_results] || []).each { |r| candidates << r[:link] }
     end
 
@@ -161,31 +202,33 @@ class MasterDataHunter
   end
 
   def fetch_multi_page_data(urls)
-    return "NO WEB SOURCES FOUND." if urls.empty?
+    return "" if urls.empty?
 
     threads = []
     results = []
-    puts "🌍 Fetching #{urls.length} pages in parallel..."
-
+    
     urls.each_with_index do |url, index|
       threads << Thread.new do
         begin
-          Timeout.timeout(8) do
+          Timeout.timeout(6) do
             user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             response = HTTParty.get(url, headers: { "User-Agent" => user_agent }, timeout: 5)
             
             if response.code == 200
               html = response.body.to_s
               doc = Nokogiri::HTML(html)
-              doc.css('script, style, nav, footer, iframe, header').remove
-              text_content = doc.text.gsub(/\s+/, " ").strip[0..2500]
+              doc.css('script, style, nav, footer, iframe, header, ad, .cookie-banner').remove
               
+              # Capture visual text
+              text_content = doc.text.gsub(/\s+/, " ").strip[0..3000]
+              
+              # Capture JSON-LD (Critical for nutrition)
               json_ld = ""
               doc.css('script[type="application/ld+json"]').each do |s|
-                 json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..1500] + " "
+                 json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..2000] + " "
               end
 
-              results << "=== SOURCE #{index + 1}: #{url} ===\nCONTENT: #{text_content}\nJSON-LD: #{json_ld}\n\n"
+              results << "=== SOURCE: #{url} ===\nCONTENT: #{text_content}\nJSON-LD: #{json_ld}\n\n"
             end
           end
         rescue; end
@@ -199,39 +242,42 @@ class MasterDataHunter
   def analyze_with_gemini(base64_image, multi_source_text, official_data, gtin, market)
     target_lang = @country_langs[market] || "English"
     
-    # Format official data for the prompt
-    official_info_text = "OFFICIAL REGISTRY DATA (High Trust): None"
+    official_info_text = "OFFICIAL REGISTRY DATA: None"
     if official_data
       official_info_text = <<~TXT
-        OFFICIAL REGISTRY DATA (High Trust):
+        OFFICIAL REGISTRY DATA (High Trust for Name):
         - Name: #{official_data['name']}
         - Category: #{official_data['categoryName']}
       TXT
     end
 
+    # UPDATED PROMPT: STRICT TRANSLATION
     prompt_text = <<~TEXT
       You are the Lead Food Product Researcher.
       
       #{official_info_text}
 
-      INPUT DATA (Scraped Websites):
+      INPUT DATA (Web Scrapes + JSON-LD):
       #{multi_source_text}
 
       #{base64_image ? "IMAGE ATTACHED: Yes" : "IMAGE ATTACHED: No"}
 
       TASK: 
-      1. Synthesis: Combine Official Data + Web Data + Image.
-      2. Priority: 
-         - Use "OFFICIAL REGISTRY DATA" for the Product Name unless it is very generic.
-         - Use Web Data/Image for Ingredients & Nutrition.
-      3. Translation: Translate ALL output into #{target_lang}.
+      1. Synthesis: Combine Official Data (trust for Name) + Web Data (trust for Ingredients/Nutri) + Image.
+      2. LANGUAGE STRICTNESS: 
+         - The Target Language is: #{target_lang.upcase}.
+         - You MUST translate ALL Output (Ingredients, Name, Allergens) into #{target_lang}.
+         - Do NOT output Hungarian, Polish, or English if the target is German. TRANSLATE IT.
+      3. Logic:
+         - If Official Name is generic, prefer a detailed retailer name.
+         - If Web Data is empty, look at the Image.
 
       OUTPUT JSON FORMAT:
       {
-        "product_name": "Brand + Name",
-        "ingredients": "Full List",
-        "allergens": "List",
-        "nutri_scope": "Per 100g",
+        "product_name": "Brand + Name (Translated)",
+        "ingredients": "Full List (Translated)",
+        "allergens": "List (Translated)",
+        "nutri_scope": "Per 100g or Per Serving",
         "energy": "kJ / kcal",
         "fat": "Value",
         "saturates": "Value",
@@ -241,7 +287,7 @@ class MasterDataHunter
         "fiber": "Value",
         "salt": "Value",
         "organic_id": "Code",
-        "sources_summary": "Short text (e.g. 'Name from Registry, Nutri from Tesco')",
+        "sources_summary": "Short text (e.g. 'Registry + Tesco')",
         "source_links": ["Full URL 1", "Full URL 2"] 
       }
     TEXT
@@ -253,7 +299,7 @@ class MasterDataHunter
     models_to_try.each do |model_id|
       url = "https://generativelanguage.googleapis.com/v1beta/#{model_id}:generateContent?key=#{GEMINI_API_KEY}"
       begin
-        response = HTTParty.post(url, body: { contents: [{ parts: parts }] }.to_json, headers: @headers, timeout: 35)
+        response = HTTParty.post(url, body: { contents: [{ parts: parts }] }.to_json, headers: @headers, timeout: 40)
         if response.code == 200
           raw_text = response.dig("candidates", 0, "content", "parts", 0, "text")
           next if raw_text.nil?
@@ -294,7 +340,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Data Hunter v2.1 (Official API)</title>
+  <title>TGTG AI Data Hunter v2.2 (Deep Search)</title>
   <style>
     body { font-family: -apple-system, system-ui, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
@@ -311,6 +357,7 @@ __END__
     tr:nth-child(even) { background: #f8f9fa; }
 
     .status-found { background: #d4edda; color: #155724; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+    .status-deep { background: #cce5ff; color: #004085; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
     .status-missing { background: #f8d7da; color: #721c24; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
     .img-preview { width: 60px; height: 60px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; }
     
@@ -325,7 +372,7 @@ __END__
 <body>
 
 <div class="container">
-  <h1>✨ TGTG AI Data Hunter <span style="font-size:0.6em; opacity:0.6">v2.1 (Official API)</span></h1>
+  <h1>✨ TGTG AI Data Hunter <span style="font-size:0.6em; opacity:0.6">v2.2 (Deep Search)</span></h1>
   <div class="controls">
     <select id="marketSelect" style="padding: 8px; border-radius: 4px;">
       <option value="DE">Germany (DE)</option>
@@ -341,7 +388,7 @@ __END__
 
   <textarea id="inputList" placeholder="Paste EANs here..."></textarea>
   <br><br>
-  <button id="startBtn" onclick="startBatch()">🚀 Start Multi-Source Analysis</button>
+  <button id="startBtn" onclick="startBatch()">🚀 Start Deep Analysis</button>
   <button id="downloadBtn" onclick="downloadCSV()" style="background: #333; display: none;">⬇️ Download CSV</button>
   <p id="statusText" style="color: #666; margin-top: 10px;">Ready.</p>
 
@@ -402,7 +449,10 @@ __END__
         const data = await response.json();
 
         let displayStatus = data.status;
-        let statusClass = (displayStatus === "Found") ? 'status-found' : 'status-missing';
+        let statusClass = 'status-found';
+        if (displayStatus.includes("Deep")) statusClass = 'status-deep';
+        if (displayStatus.includes("Error") || displayStatus.includes("Missing")) statusClass = 'status-missing';
+        
         const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-preview"></a>` : '-';
         
         // Build Sources HTML
