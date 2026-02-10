@@ -37,7 +37,7 @@ class MasterDataHunter
       "ES" => "site:carrefour.es OR site:mercadona.es OR site:dia.es OR site:alcampo.es",
       "SE" => "site:ica.se OR site:coop.se OR site:willys.se OR site:hemkop.se",
       "NO" => "site:oda.com OR site:meny.no OR site:spar.no",
-      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:biedronka.pl" OR site:kaufland.pl,
+      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:biedronka.pl OR site:kaufland.pl",
       "PT" => "site:continente.pt OR site:auchan.pt OR site:pingo-doce.pt"
     }
   end
