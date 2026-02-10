@@ -56,7 +56,7 @@ class MasterDataHunter
     }
   end
 
-  def process_product(gtin, market)
+def process_product(gtin, market)
     return { found: false, status: "Missing GEMINI_API_KEY" } if GEMINI_API_KEY.nil? || GEMINI_API_KEY.empty?
 
     confirmed_sources = []
@@ -73,7 +73,7 @@ class MasterDataHunter
       confirmed_sources << { type: "image", title: "Source Image", url: image_data[:url] }
     end
 
-    # 3. WEB HUNT (Standard)
+    # 3. WEB HUNT (Standard EAN)
     candidate_urls = find_candidate_sources(gtin, market, :ean)
     web_data = fetch_multi_page_data(candidate_urls)
     web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
@@ -81,23 +81,49 @@ class MasterDataHunter
     # 4. FIRST ANALYSIS
     ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, web_data[:text], official_data, gtin, market)
 
-    # 5. DEEP SEARCH FALLBACK (Name-Based)
+    # 5. DEEP SEARCH CHECK (The Fix)
+    # We check if ingredients are missing in the FIRST result.
+    # If they are missing (even if we had an image), we MUST try the Name Search.
     if needs_fallback?(ai_result)
       search_name = official_data ? official_data['name'] : ai_result["product_name"]
       
-      # Clean name for search
+      # Clean name and ensure it's valid
       if search_name && search_name.length > 3 && !search_name.include?("Webdaten")
-        puts "🔄 Deep Search for: #{search_name}"
+        puts "🔄 Deep Search Triggered for: #{search_name}"
+        
+        # SEARCH BY NAME
         name_urls = find_candidate_sources(search_name, market, :name)
         fallback_data = fetch_multi_page_data(name_urls)
         
+        # Add new sources
         fallback_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
 
-        full_context = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH ===\n" + fallback_data[:text]
+        # Combine EVERYTHING: Old Text + New Name Text
+        full_context = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_data[:text]
+        
+        # Re-run AI
         ai_result = analyze_with_gemini(image_data ? image_data[:base64] : nil, full_context, official_data, gtin, market)
         ai_result["status"] = "Deep Search (Found)"
       end
     end
+
+    if ai_result[:error]
+      return empty_result(gtin, market, ai_result[:error], image_data ? image_data[:url] : nil)
+    end
+
+    origin_country = official_data ? official_data['issuingCountry'] : nil
+
+    {
+      found: true,
+      gtin: gtin,
+      status: ai_result["status"] || "Found",
+      market: market,
+      image_url: image_data ? image_data[:url] : nil,
+      issuing_country: origin_country,
+      **ai_result,
+      defined_sources: confirmed_sources
+    }
+  end
 
     if ai_result[:error]
       return empty_result(gtin, market, ai_result[:error], image_data ? image_data[:url] : nil)
@@ -346,7 +372,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.7 (Amazon + Origin)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.7 (Restoring the "HailMary")</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
