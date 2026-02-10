@@ -167,7 +167,9 @@ class MasterDataHunter
     return [] if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = (market == "UK" ? "gb" : market.downcase)
     goldmine = @goldmine_sites[market]
-    bans = "-site:openfoodfacts.org -site:wikipedia.org -site:amazon.* -site:pinterest.*"
+    
+    # --- CHANGE 1: UNBAN AMAZON, BAN TIKTOK ---
+    bans = "-site:openfoodfacts.org -site:wikipedia.org -site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
     candidates = []
 
     if type == :ean && goldmine
@@ -223,6 +225,7 @@ class MasterDataHunter
     
     official_txt = official ? "OFFICIAL REGISTRY IDENTITY: #{official['name']}" : "OFFICIAL REGISTRY: None"
 
+    # --- CHANGE 2: PROMPT TWEAK FOR GARBAGE AVOIDANCE ---
     prompt = <<~TEXT
       You are a Food Data Expert.
       #{official_txt}
@@ -237,11 +240,12 @@ class MasterDataHunter
       
       TASK:
       1. Synthesize all data.
-      2. **PRODUCT NAME:** If an Official Registry name exists, use it as the base, BUT YOU MUST TRANSLATE IT to the primary language of the market (e.g., German for DE, French for BE).
-      3. **BRAND:** Extract the Brand Name.
-      4. **BELGIUM (BE) SPECIAL RULE:** If Market is 'BE', output Ingredients, Allergens, and 'May Contain' in THREE languages: German, French, and Dutch. Separate them clearly with line breaks.
-      5. **NET WEIGHT:** Extract net weight (e.g. 200g, 500ml).
-      6. **MAY CONTAIN:** Extract 'May contain' / traces info.
+      2. **PRIORITY RULE:** If the Text Data contains social media noise, irrelevant comments, or "Login" prompts, IGNORE IT and rely on the Image or Official Registry.
+      3. **PRODUCT NAME:** If an Official Registry name exists, use it as the base, BUT YOU MUST TRANSLATE IT to the primary language of the market (e.g., German for DE, French for BE).
+      4. **BRAND:** Extract the Brand Name.
+      5. **BELGIUM (BE) SPECIAL RULE:** If Market is 'BE', output Ingredients, Allergens, and 'May Contain' in THREE languages: German, French, and Dutch. Separate them clearly with line breaks.
+      6. **NET WEIGHT:** Extract net weight (e.g. 200g, 500ml).
+      7. **MAY CONTAIN:** Extract 'May contain' / traces info.
 
       OUTPUT JSON (Strictly this schema):
       {
@@ -299,7 +303,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v2.6</title>
+  <title>TGTG AI Hunter v2.7</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -342,7 +346,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.6 (Image + Origin Restored)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.7 (Amazon + Origin)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -375,7 +379,8 @@ __END__
       <thead>
         <tr>
           <th>Status</th>
-          <th>Image</th> <th>EAN</th>
+          <th>Image</th>
+          <th>EAN</th>
           <th>Brand</th>
           <th>Product Name</th>
           <th>Origin</th>
@@ -422,7 +427,6 @@ __END__
 
     for (const gtin of lines) {
       const tr = document.createElement('tr');
-      // Updated colspan to 20 for new column
       let emptyCells = ""; for(let i=0; i<19; i++) { emptyCells += "<td></td>"; }
       tr.innerHTML = `<td><span class="status-badge" style="background:#eee; color:#666;">...</span></td>` + emptyCells;
       tbody.appendChild(tr);
@@ -435,7 +439,6 @@ __END__
         if (data.status.includes("Deep")) sClass = 'st-deep';
         if (data.status.includes("Error") || data.status.includes("Missing")) sClass = 'st-miss';
 
-        // Image Logic
         const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>` : '-';
 
         let sourcesHTML = `<div class="source-list">`;
@@ -457,7 +460,8 @@ __END__
 
         tr.innerHTML = `
           <td><span class="status-badge ${sClass}">${data.status}</span></td>
-          <td>${imgHTML}</td> <td>${gtin}</td>
+          <td>${imgHTML}</td>
+          <td>${gtin}</td>
           <td>${data.brand || '-'}</td>
           <td style="font-weight:bold;">${data.product_name || '-'}</td>
           <td style="text-align:center;">${data.issuing_country || '-'}</td>
