@@ -35,7 +35,7 @@ class MasterDataHunter
       "NO" => "Norwegian", 
       "PL" => "Polish", 
       "PT" => "Portuguese",
-      "BE" => "German, French, AND Dutch (Must provide all 3)" # <--- Trilingual Requirement
+      "BE" => "German, French, AND Dutch (Must provide all 3)"
     }
 
     # 2. THE GOLDMINE (Trusted Retailers)
@@ -112,7 +112,7 @@ class MasterDataHunter
       status: ai_result["status"] || "Found",
       market: market,
       image_url: image_data ? image_data[:url] : nil,
-      issuing_country: origin_country, # <--- NEW FIELD: Origin
+      issuing_country: origin_country,
       **ai_result,
       defined_sources: confirmed_sources
     }
@@ -223,7 +223,6 @@ class MasterDataHunter
     
     official_txt = official ? "OFFICIAL REGISTRY IDENTITY: #{official['name']}" : "OFFICIAL REGISTRY: None"
 
-    # --- NEW PROMPT LOGIC ---
     prompt = <<~TEXT
       You are a Food Data Expert.
       #{official_txt}
@@ -300,7 +299,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v2.5</title>
+  <title>TGTG AI Hunter v2.6</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -313,7 +312,7 @@ __END__
     button:disabled { background: #ccc; cursor: not-allowed; }
 
     .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #e1e4e8; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 3200px; } /* Increased width for new columns */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 3200px; } 
     th { text-align: left; background: #00816A; color: white; padding: 14px 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; font-weight: 600; letter-spacing: 0.5px; }
     td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 300px; line-height: 1.4; }
     tr:nth-child(even) { background: #f8f9fa; }
@@ -343,7 +342,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.5 (Trilingual BE + Full Specs)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.6 (Image + Origin Restored)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -376,10 +375,11 @@ __END__
       <thead>
         <tr>
           <th>Status</th>
-          <th>EAN</th>
+          <th>Image</th> <th>EAN</th>
           <th>Brand</th>
           <th>Product Name</th>
-          <th>Origin</th> <th>Sources</th>
+          <th>Origin</th>
+          <th>Sources</th>
           <th>Net Weight</th>
           <th>Organic ID</th>
           <th>Ingredients</th>
@@ -422,7 +422,8 @@ __END__
 
     for (const gtin of lines) {
       const tr = document.createElement('tr');
-      let emptyCells = ""; for(let i=0; i<18; i++) { emptyCells += "<td></td>"; }
+      // Updated colspan to 20 for new column
+      let emptyCells = ""; for(let i=0; i<19; i++) { emptyCells += "<td></td>"; }
       tr.innerHTML = `<td><span class="status-badge" style="background:#eee; color:#666;">...</span></td>` + emptyCells;
       tbody.appendChild(tr);
 
@@ -433,6 +434,9 @@ __END__
         let sClass = 'st-found';
         if (data.status.includes("Deep")) sClass = 'st-deep';
         if (data.status.includes("Error") || data.status.includes("Missing")) sClass = 'st-miss';
+
+        // Image Logic
+        const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>` : '-';
 
         let sourcesHTML = `<div class="source-list">`;
         if (data.sources_summary) sourcesHTML += `<span class="ai-note">${data.sources_summary}</span>`;
@@ -449,12 +453,11 @@ __END__
         }
         sourcesHTML += `</div>`;
         
-        // Format Trilingual text nicely for display (Newlines to <br>)
         const fmt = (text) => (text || "-").replace(/\n/g, "<br>");
 
         tr.innerHTML = `
           <td><span class="status-badge ${sClass}">${data.status}</span></td>
-          <td>${gtin}</td>
+          <td>${imgHTML}</td> <td>${gtin}</td>
           <td>${data.brand || '-'}</td>
           <td style="font-weight:bold;">${data.product_name || '-'}</td>
           <td style="text-align:center;">${data.issuing_country || '-'}</td>
@@ -476,7 +479,7 @@ __END__
         `;
         resultsData.push(data);
       } catch (e) {
-        tr.innerHTML = `<td colspan="19" style="color:red; text-align:center;">Network/Server Error for ${gtin}</td>`;
+        tr.innerHTML = `<td colspan="20" style="color:red; text-align:center;">Network/Server Error for ${gtin}</td>`;
       }
       processed++;
       updateProgress();
