@@ -35,7 +35,7 @@ class MasterDataHunter
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:ocado.com",
       "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl",
       "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be",
-      "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:motatos.de",
+      "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:motatos.de OR site:picnic.app",
       "AT" => "site:billa.at OR site:spar.at OR site:gurkerl.at OR site:motatos.at",
       "DK" => "site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk OR site:netto.dk",
       "IT" => "site:carrefour.it OR site:conad.it OR site:coop.it",
@@ -59,16 +59,30 @@ class MasterDataHunter
       confirmed_sources << { type: "registry", title: "Official Registry", url: "https://www.ean-search.org/?q=#{gtin}" }
     end
 
-    # --- STEP 2: SMART UNIFIED SEARCH (The Fix) ---
-    # If Registry Name is missing, we try to "Scrape" a name from Google Results titles
+    # --- STEP 2: SMART UNIFIED SEARCH (v3.1 Logic) ---
     search_result = find_unified_sources(gtin, registry_name, market)
     candidate_urls = search_result[:urls]
-    inferred_name = search_result[:inferred_name] # New: Name guessed from Google Title
+    inferred_name = search_result[:inferred_name] 
 
+    # Scrape Content (Protected against crashing)
     web_data = fetch_multi_page_data(candidate_urls)
     web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
 
-    # --- STEP 3: IMAGE HUNT (With Guardrail) ---
+    # --- STEP 2.5: QUALITY RESCUE (Fix for Empty Picnic/PicClick results) ---
+    # If text is too short (< 400 chars) but we have a name, force a Deep Search
+    rescue_name = registry_name || inferred_name
+    if web_data[:text].length < 400 && rescue_name
+      deep_urls = find_deep_sources(rescue_name, market)
+      deep_data = fetch_multi_page_data(deep_urls)
+      
+      # Append new data
+      if deep_data[:text].length > 100
+        web_data[:text] += "\n\n=== DEEP SEARCH RESCUE ===\n" + deep_data[:text]
+        deep_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
+      end
+    end
+
+    # --- STEP 3: IMAGE HUNT (Protected) ---
     image_data = find_best_image(gtin, market)
     if image_data
       confirmed_sources << { type: "image", title: "Source Image", url: image_data[:url] }
@@ -77,10 +91,9 @@ class MasterDataHunter
     # --- STEP 4: AI ANALYSIS ---
     # Fail fast only if truly blind
     if (image_data.nil? || image_data[:base64].nil?) && web_data[:text].strip.empty?
-      return empty_result(gtin, market, "No Data Found (Blind)", image_data ? image_data[:url] : nil)
+      return empty_result(gtin, market, "No Data Found (Blind)", nil)
     end
 
-    # Pass the Inferred Name to AI if Official Name is missing
     final_name_context = official_data ? official_data : { 'name' => inferred_name }
 
     ai_result = analyze_with_gemini(
@@ -96,13 +109,16 @@ class MasterDataHunter
     end
 
     origin_country = official_data ? official_data['issuingCountry'] : nil
+    
+    # Use Base64 for display to avoid hotlink blocks
+    display_image = image_data && image_data[:base64] ? "data:image/jpeg;base64,#{image_data[:base64]}" : (image_data ? image_data[:url] : nil)
 
     {
       found: true,
       gtin: gtin,
-      status: (web_data[:valid_urls].any? ? "Found (Web Verified)" : "Registry Only"),
+      status: (web_data[:text].length > 100 ? "Found (Verified)" : "Registry Only"),
       market: market,
-      image_url: image_data ? image_data[:url] : nil,
+      image_url: display_image, 
       issuing_country: origin_country,
       **ai_result,
       defined_sources: confirmed_sources.uniq { |s| s[:url] }
@@ -115,13 +131,13 @@ class MasterDataHunter
     URI.parse(url).host.sub(/^www\./, '') rescue "Link"
   end
 
-  # --- SMART SEARCH LOGIC (Fixes the "Wally and Whiz" issue) ---
+  # --- SMART SEARCH LOGIC (v3.1) ---
   def find_unified_sources(gtin, name, market)
     return { urls: [], inferred_name: nil } if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
     goldmine = @goldmine_sites[market]
     
-    # TEXT Bans: OpenFoodFacts is OK here for data, but banned for images later
+    # Standard Bans
     bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com -site:youtube.com"
 
     urls = []
@@ -129,8 +145,7 @@ class MasterDataHunter
 
     # Query 1: EAN on Trusted Retailers
     q1 = "#{goldmine} #{gtin} #{bans}" if goldmine
-    
-    # Query 2: Broad EAN Search (Used to find the name if we don't have it)
+    # Query 2: Broad EAN Search
     q2 = "#{gtin} #{bans}" 
 
     [q1, q2].compact.each do |q|
@@ -140,27 +155,30 @@ class MasterDataHunter
         
         results.each do |r| 
           urls << r[:link]
-          # If we lack a name, grab it from the first valid title!
+          # Extract name from title if we are missing it
           if name.nil? && inferred_name.nil? && r[:title]
-             # Cleaning the title to get a usable product name
              inferred_name = r[:title].split(/ [|-] /).first.strip 
           end
         end
       rescue; next; end
     end
+    { urls: urls.uniq.first(6), inferred_name: inferred_name }
+  end
 
-    # Query 3: The Deep Search (Now uses Inferred Name if Registry Name was nil)
-    search_name = name || inferred_name
-    if search_name && search_name.length > 3
-      clean_name = search_name.gsub(/[^a-zA-Z0-9\s]/, '')
-      q3 = "#{clean_name} ingredients nutrition #{bans}"
-      begin
-        res = GoogleSearch.new(q: q3, gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
-        (res[:organic_results] || []).each { |r| urls << r[:link] }
-      rescue; end
-    end
-
-    { urls: urls.uniq.first(8), inferred_name: inferred_name }
+  def find_deep_sources(name, market)
+    return [] if name.nil? || name.length < 3
+    gl = (market == "UK" ? "gb" : market.downcase)
+    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com"
+    
+    clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
+    q = "#{clean_name} ingredients nutrition #{bans}"
+    
+    urls = []
+    begin
+      res = GoogleSearch.new(q: q, gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
+      (res[:organic_results] || []).each { |r| urls << r[:link] }
+    rescue; end
+    urls
   end
 
   # --- IMAGE DOWNLOADER (With OpenFoodFacts Guardrail) ---
@@ -168,10 +186,9 @@ class MasterDataHunter
     return nil if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
     
-    # GUARDRAIL: Explicitly ban OpenFoodFacts from Image Search
+    # GUARDRAIL: Strict ban as requested
     bans = "-site:openfoodfacts.org"
 
-    # 1. Search for images
     queries = [
       "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\" #{bans}",
       "\"#{gtin}\" product #{bans}"
@@ -179,33 +196,34 @@ class MasterDataHunter
     
     images = []
     queries.each do |q|
-      res = GoogleSearch.new(q: q, tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
-      found = (res[:images_results] || []).first(3)
-      images.concat(found) if found
-      break if images.any?
+      begin
+        res = GoogleSearch.new(q: q, tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
+        found = (res[:images_results] || []).first(3)
+        images.concat(found) if found
+        break if images.any?
+      rescue; next; end
     end
 
     return nil if images.empty?
 
-    # 2. Try to download
-    images.each do |img|
+    # Try to download safely
+    images.first(2).each do |img|
       url = img[:original]
       next if url.nil? || url.include?("placeholder")
-      
       begin
-        # Mask as Browser
-        tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 5, timeout_read: 10, headers: { "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
+        # 4s Timeout to prevent hanging
+        tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 4, timeout_read: 4, headers: { "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
         base64 = Base64.strict_encode64(File.read(tempfile.path))
         return { url: url, source: img[:link], base64: base64 }
       rescue; next; end
     end
-
-    # 3. Fallback: Return URL even if download failed (for UI)
+    
+    # Fallback to URL only if download fails
     first_valid = images.find { |i| !i[:original].include?("placeholder") }
     return first_valid ? { url: first_valid[:original], source: first_valid[:link], base64: nil } : nil
   end
 
-  # --- SCRAPER ---
+  # --- SCRAPER (Crash-Proof) ---
   def fetch_multi_page_data(urls)
     return { text: "", valid_urls: [] } if urls.empty?
 
@@ -215,29 +233,41 @@ class MasterDataHunter
     
     urls.each do |url|
       threads << Thread.new do
+        # SAFETY WRAPPER: This ensures one bad site doesn't crash the loop
         begin
-          Timeout.timeout(10) do
+          Timeout.timeout(6) do 
             agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 8)
+            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 5)
             
             if response.code == 200
               doc = Nokogiri::HTML(response.body)
               doc.css('script, style, nav, footer, iframe, header, .cookie').remove
-              txt = doc.text.gsub(/\s+/, " ").strip[0..10000]
+              txt = doc.text.gsub(/\s+/, " ").strip[0..8000]
               
               json_ld = ""
               doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
               
               if txt.length > 50
-                valid_urls << url
-                results_text << "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
+                # Use Thread.current to safely pass data back
+                Thread.current[:valid] = url
+                Thread.current[:text] = "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
               end
             end
           end
-        rescue; end
+        rescue => e
+          # Silently ignore timeout/error for this specific URL
+        end
       end
     end
-    threads.each(&:join)
+
+    threads.each do |t| 
+      t.join
+      if t[:valid]
+        valid_urls << t[:valid]
+        results_text << t[:text]
+      end
+    end
+    
     { text: results_text.join("\n"), valid_urls: valid_urls }
   end
 
@@ -245,15 +275,13 @@ class MasterDataHunter
     return nil if EAN_SEARCH_TOKEN.nil? || EAN_SEARCH_TOKEN.empty?
     begin
       url = "https://api.ean-search.org/api?token=#{EAN_SEARCH_TOKEN}&op=barcode-lookup&format=json&ean=#{gtin}"
-      resp = HTTParty.get(url, timeout: 5)
+      resp = HTTParty.get(url, timeout: 3)
       return JSON.parse(resp.body).first if resp.code == 200 rescue nil
     rescue; nil; end
   end
 
   def analyze_with_gemini(base64_image, text_data, official, gtin, market)
     target_lang = @country_langs[market] || "English"
-    
-    # Use Official Name OR Inferred Name
     name_info = official ? official['name'] : (official.is_a?(Hash) ? official['name'] : "Unknown")
     official_txt = "PRODUCT IDENTITY: #{name_info}"
 
@@ -321,9 +349,13 @@ end
 
 get '/api/search' do
   content_type :json
-  hunter = MasterDataHunter.new
-  result = hunter.process_product(params[:gtin], params[:market])
-  result.to_json
+  begin
+    hunter = MasterDataHunter.new
+    result = hunter.process_product(params[:gtin], params[:market])
+    result.to_json
+  rescue => e
+    { found: false, status: "Server Error: #{e.message}", gtin: params[:gtin] }.to_json
+  end
 end
 
 __END__
@@ -332,7 +364,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v3.1 (Smart Rescue)</title>
+  <title>TGTG AI Hunter v3.4 (Smart+Stable)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -367,6 +399,7 @@ __END__
     .src-btn:hover { border-color: #00816A; color: #00816A; background: #f0fdf9; }
     .src-registry { border-left: 3px solid #00816A; }
     .src-web { border-left: 3px solid #007bff; }
+    .src-rescue { border-left: 3px solid #dc3545; }
     .src-img { border-left: 3px solid #6f42c1; }
     .ai-note { font-size: 10px; color: #888; margin-bottom: 5px; font-style: italic; }
   </style>
@@ -375,7 +408,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.1 (Smart Rescue)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.4 (Smart+Stable)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -469,7 +502,7 @@ __END__
 
         let sClass = 'st-found';
         if (data.status.includes("Registry")) sClass = 'st-reg';
-        if (data.status.includes("Error") || data.status.includes("Missing")) sClass = 'st-miss';
+        if (data.status.includes("Error") || data.status.includes("Missing") || data.status.includes("Server")) sClass = 'st-miss';
 
         const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>` : '-';
 
@@ -481,6 +514,7 @@ __END__
               let cssClass = "src-web";
               if(src.type === 'registry') { icon = "🏛️"; cssClass = "src-registry"; }
               if(src.type === 'image')    { icon = "📸"; cssClass = "src-img"; }
+              if(src.type === 'rescue')   { icon = "🆘"; cssClass = "src-rescue"; }
               sourcesHTML += `<a href="${src.url}" target="_blank" class="src-btn ${cssClass}">${icon} ${src.title}</a>`;
            });
         } else {
