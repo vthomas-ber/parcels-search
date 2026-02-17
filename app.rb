@@ -169,25 +169,31 @@ class MasterDataHunter
     return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = (market == "UK" ? "gb" : market.downcase)
     
-    # Try Barcode sites first for clean images
+    # 1. Search Strategy
     res = GoogleSearch.new(q: "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
-    
-    # Fallback to general search
     if (res[:images_results] || []).empty?
       res = GoogleSearch.new(q: "#{gtin} product", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
     end
 
-    (res[:images_results] || []).first(5).each do |img|
+    images = (res[:images_results] || []).first(5)
+    return nil if images.empty?
+
+    # 2. Try to download for AI (Best Case)
+    images.each do |img|
       url = img[:original]
       next if url.nil? || url.include?("placeholder")
+      
       begin
-        # Download with timeout
-        tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 3, timeout_read: 5)
+        # Relaxed timeout and added User-Agent to bypass blocks
+        tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 5, timeout_read: 10, headers: { "User-Agent" => "Mozilla/5.0" })
         base64 = Base64.strict_encode64(File.read(tempfile.path))
         return { url: url, source: img[:link], base64: base64 }
       rescue; next; end
     end
-    nil
+
+    # 3. FALLBACK: If all downloads fail, return the first URL anyway (for UI only)
+    first_valid = images.find { |i| !i[:original].include?("placeholder") }
+    return first_valid ? { url: first_valid[:original], source: first_valid[:link], base64: nil } : nil
   end
 
   def fetch_multi_page_data(urls)
