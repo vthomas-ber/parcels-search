@@ -29,7 +29,7 @@ class MasterDataHunter
       "BE" => "German, French, AND Dutch (Must provide all 3)"
     }
 
-    # 2. THE GOLDMINE
+    # 2. THE GOLDMINE (Retailers)
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:openfoodfacts.org",
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:ocado.com",
@@ -51,39 +51,53 @@ class MasterDataHunter
     return { found: false, status: "Missing GEMINI_API_KEY" } if GEMINI_API_KEY.nil? || GEMINI_API_KEY.empty?
 
     confirmed_sources = []
-
-    # --- STEP 1: OFFICIAL REGISTRY ---
+    
+    # --- STEP 1: OFFICIAL REGISTRY (Fast) ---
     official_data = fetch_official_ean_data(gtin)
     registry_name = official_data ? official_data['name'] : nil
     if official_data
       confirmed_sources << { type: "registry", title: "Official Registry", url: "https://www.ean-search.org/?q=#{gtin}" }
     end
 
-    # --- STEP 2: SMART UNIFIED SEARCH (v3.1 Logic) ---
-    search_result = find_unified_sources(gtin, registry_name, market)
-    candidate_urls = search_result[:urls]
-    inferred_name = search_result[:inferred_name] 
-
-    # Scrape Content (Protected against crashing)
-    web_data = fetch_multi_page_data(candidate_urls)
-    web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
-
-    # --- STEP 2.5: QUALITY RESCUE (Fix for Empty Picnic/PicClick results) ---
-    # If text is too short (< 400 chars) but we have a name, force a Deep Search
-    rescue_name = registry_name || inferred_name
-    if web_data[:text].length < 400 && rescue_name
-      deep_urls = find_deep_sources(rescue_name, market)
-      deep_data = fetch_multi_page_data(deep_urls)
-      
-      # Append new data
-      if deep_data[:text].length > 100
-        web_data[:text] += "\n\n=== DEEP SEARCH RESCUE ===\n" + deep_data[:text]
-        deep_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
-      end
+    # --- STEP 2: PARALLEL SEARCH EXECUTION ---
+    # We run 3 tasks at the exact same time:
+    # 1. Retailer Search (Goldmine)
+    # 2. Deep Search (Name + Ingredients)
+    # 3. Image Search
+    
+    threads = []
+    
+    # Task A: Retailer Search
+    retailer_results = []
+    threads << Thread.new do
+      retailer_results = find_retailer_urls(gtin, market)
     end
 
-    # --- STEP 3: IMAGE HUNT (Protected) ---
-    image_data = find_best_image(gtin, market)
+    # Task B: Deep Search (Only if we have a name, or can infer one)
+    deep_results = []
+    threads << Thread.new do
+      # If registry name is missing, we try to guess it from a quick Google query first
+      search_name = registry_name || infer_name_from_ean(gtin, market)
+      deep_results = find_deep_urls(search_name, market) if search_name
+    end
+
+    # Task C: Image Search
+    image_data = nil
+    threads << Thread.new do
+      image_data = find_best_image(gtin, market)
+    end
+
+    # Wait for all searches to finish (Max 5 seconds wait)
+    threads.each { |t| t.join(5) }
+
+    # Combine URLs (Retailer First, then Deep)
+    all_urls = (retailer_results + deep_results).uniq.first(5) # Cap at 5 total URLs to scrape
+
+    # --- STEP 3: PARALLEL SCRAPING ---
+    # Now we scrape the 5 URLs found, all at once.
+    web_data = fetch_parallel_page_data(all_urls)
+    web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
+    
     if image_data
       confirmed_sources << { type: "image", title: "Source Image", url: image_data[:url] }
     end
@@ -94,7 +108,7 @@ class MasterDataHunter
       return empty_result(gtin, market, "No Data Found (Blind)", nil)
     end
 
-    final_name_context = official_data ? official_data : { 'name' => inferred_name }
+    final_name_context = official_data ? official_data : { 'name' => registry_name }
 
     ai_result = analyze_with_gemini(
       image_data ? image_data[:base64] : nil, 
@@ -109,8 +123,6 @@ class MasterDataHunter
     end
 
     origin_country = official_data ? official_data['issuingCountry'] : nil
-    
-    # Use Base64 for display to avoid hotlink blocks
     display_image = image_data && image_data[:base64] ? "data:image/jpeg;base64,#{image_data[:base64]}" : (image_data ? image_data[:url] : nil)
 
     {
@@ -131,100 +143,76 @@ class MasterDataHunter
     URI.parse(url).host.sub(/^www\./, '') rescue "Link"
   end
 
-  # --- SMART SEARCH LOGIC (v3.1) ---
-  def find_unified_sources(gtin, name, market)
-    return { urls: [], inferred_name: nil } if SERPAPI_KEY.nil?
+  # --- SEARCH METHODS ---
+  
+  def infer_name_from_ean(gtin, market)
+    return nil if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
-    goldmine = @goldmine_sites[market]
-    
-    # Standard Bans
-    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com -site:youtube.com"
-
-    urls = []
-    inferred_name = nil
-
-    # Query 1: EAN on Trusted Retailers
-    q1 = "#{goldmine} #{gtin} #{bans}" if goldmine
-    # Query 2: Broad EAN Search
-    q2 = "#{gtin} #{bans}" 
-
-    [q1, q2].compact.each do |q|
-      begin
-        res = GoogleSearch.new(q: q, gl: gl, num: 4, api_key: SERPAPI_KEY).get_hash
-        results = res[:organic_results] || []
-        
-        results.each do |r| 
-          urls << r[:link]
-          # Extract name from title if we are missing it
-          if name.nil? && inferred_name.nil? && r[:title]
-             inferred_name = r[:title].split(/ [|-] /).first.strip 
-          end
-        end
-      rescue; next; end
-    end
-    { urls: urls.uniq.first(6), inferred_name: inferred_name }
+    begin
+      # Quick check to see if Google knows the title
+      res = GoogleSearch.new(q: "#{gtin}", gl: gl, num: 2, api_key: SERPAPI_KEY).get_hash
+      first_result = (res[:organic_results] || []).first
+      return first_result[:title].split(/ [|-] /).first.strip if first_result
+    rescue; end
+    nil
   end
 
-  def find_deep_sources(name, market)
-    return [] if name.nil? || name.length < 3
+  def find_retailer_urls(gtin, market)
+    return [] if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
-    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com"
-    
-    clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
-    q = "#{clean_name} ingredients nutrition #{bans}"
+    goldmine = @goldmine_sites[market]
+    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:youtube.com"
+    return [] unless goldmine
     
     urls = []
     begin
-      res = GoogleSearch.new(q: q, gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
+      res = GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
       (res[:organic_results] || []).each { |r| urls << r[:link] }
     rescue; end
     urls
   end
 
-  # --- IMAGE DOWNLOADER (With OpenFoodFacts Guardrail) ---
+  def find_deep_urls(name, market)
+    return [] if name.nil? || name.length < 3
+    gl = (market == "UK" ? "gb" : market.downcase)
+    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
+    clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
+    
+    urls = []
+    begin
+      # Explicitly asking for ingredients
+      res = GoogleSearch.new(q: "#{clean_name} ingredients nutrition #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
+      (res[:organic_results] || []).each { |r| urls << r[:link] }
+    rescue; end
+    urls
+  end
+
+  # --- IMAGE DOWNLOADER ---
   def find_best_image(gtin, market)
     return nil if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
-    
-    # GUARDRAIL: Strict ban as requested
     bans = "-site:openfoodfacts.org"
 
-    queries = [
-      "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\" #{bans}",
-      "\"#{gtin}\" product #{bans}"
-    ]
-    
-    images = []
-    queries.each do |q|
-      begin
-        res = GoogleSearch.new(q: q, tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
-        found = (res[:images_results] || []).first(3)
-        images.concat(found) if found
-        break if images.any?
-      rescue; next; end
-    end
-
-    return nil if images.empty?
-
-    # Try to download safely
-    images.first(2).each do |img|
-      url = img[:original]
-      next if url.nil? || url.include?("placeholder")
-      begin
-        # 4s Timeout to prevent hanging
-        tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 4, timeout_read: 4, headers: { "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
-        base64 = Base64.strict_encode64(File.read(tempfile.path))
-        return { url: url, source: img[:link], base64: base64 }
-      rescue; next; end
-    end
-    
-    # Fallback to URL only if download fails
-    first_valid = images.find { |i| !i[:original].include?("placeholder") }
-    return first_valid ? { url: first_valid[:original], source: first_valid[:link], base64: nil } : nil
+    begin
+      res = GoogleSearch.new(q: "#{gtin} product #{bans}", tbm: "isch", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
+      images = (res[:images_results] || []).first(2) 
+      
+      images.each do |img|
+        url = img[:original]
+        next if url.nil? || url.include?("placeholder")
+        begin
+          # Strict 4s timeout
+          tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 4, timeout_read: 4, headers: { "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
+          base64 = Base64.strict_encode64(File.read(tempfile.path))
+          return { url: url, source: img[:link], base64: base64 }
+        rescue; next; end
+      end
+    rescue; end
+    nil
   end
 
-  # --- SCRAPER (Crash-Proof) ---
-  def fetch_multi_page_data(urls)
+  # --- PARALLEL SCRAPER (The Stability Core) ---
+  def fetch_parallel_page_data(urls)
     return { text: "", valid_urls: [] } if urls.empty?
 
     threads = []
@@ -233,9 +221,9 @@ class MasterDataHunter
     
     urls.each do |url|
       threads << Thread.new do
-        # SAFETY WRAPPER: This ensures one bad site doesn't crash the loop
+        # WRAPPER: Each scraper gets its own safe environment
         begin
-          Timeout.timeout(6) do 
+          Timeout.timeout(6) do # 6s per site. If site is slower, we skip it.
             agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 5)
             
@@ -247,16 +235,14 @@ class MasterDataHunter
               json_ld = ""
               doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
               
-              if txt.length > 50
-                # Use Thread.current to safely pass data back
+              # Ignore PicClick/low-quality automated pages
+              if txt.length > 200
                 Thread.current[:valid] = url
                 Thread.current[:text] = "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
               end
             end
           end
-        rescue => e
-          # Silently ignore timeout/error for this specific URL
-        end
+        rescue; end # Fail silently for this URL, let others finish
       end
     end
 
@@ -364,7 +350,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v3.4 (Smart+Stable)</title>
+  <title>TGTG AI Hunter v3.6 (Parallel)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -408,7 +394,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.4 (Smart+Stable)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.6 (Parallel)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
