@@ -25,8 +25,7 @@ class MasterDataHunter
       "UK" => "English", "GB" => "English", "FR" => "French",
       "IT" => "Italian", "ES" => "Spanish", "NL" => "Dutch",
       "DK" => "Danish", "SE" => "Swedish", "NO" => "Norwegian",
-      "PL" => "Polish", "PT" => "Portuguese",
-      "FI" => "Finnish",
+      "PL" => "Polish", "PT" => "Portuguese", "FI" => "Finnish",
       "BE" => "German, French, AND Dutch (Must provide all 3)"
     }
 
@@ -53,32 +52,30 @@ class MasterDataHunter
 
     confirmed_sources = []
 
-    # --- STEP 1: OFFICIAL REGISTRY (Identity Check) ---
+    # --- STEP 1: OFFICIAL REGISTRY ---
     official_data = fetch_official_ean_data(gtin)
     registry_name = official_data ? official_data['name'] : nil
-    
     if official_data
       confirmed_sources << { type: "registry", title: "Official Registry", url: "https://www.ean-search.org/?q=#{gtin}" }
     end
 
-    # --- STEP 2: UNIFIED WEB SEARCH (The "Net-Caster") ---
-    # We search EAN, Retailers, AND Name (if available) all at once.
-    # This ensures we get the "ingredients" page even if the main EAN page is just a price list.
+    # --- STEP 2: UNIFIED WEB SEARCH (EAN + Name) ---
     candidate_urls = find_unified_sources(gtin, registry_name, market)
-    
-    # Scrape the content from these URLs in parallel
     web_data = fetch_multi_page_data(candidate_urls)
     web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
 
-    # --- STEP 3: IMAGE HUNT (Visual Verification) ---
+    # --- STEP 3: ROBUST IMAGE HUNT (Fixes Missing Images) ---
     image_data = find_best_image(gtin, market)
     if image_data
       confirmed_sources << { type: "image", title: "Source Image", url: image_data[:url] }
     end
 
-    # --- STEP 4: AI ANALYSIS (The "Loose Strictness" Logic) ---
-    # We feed EVERYTHING to Gemini: The Image + The Scraped Text + The Registry Data.
-    # The prompt instructs it to prioritize Text if the Image is unclear.
+    # --- STEP 4: AI ANALYSIS ---
+    # If both Image AND Text are missing, we fail fast to avoid AI errors
+    if (image_data.nil? || image_data[:base64].nil?) && web_data[:text].strip.empty?
+      return empty_result(gtin, market, "No Data Found (Blind)", image_data ? image_data[:url] : nil)
+    end
+
     ai_result = analyze_with_gemini(
       image_data ? image_data[:base64] : nil, 
       web_data[:text], 
@@ -96,7 +93,7 @@ class MasterDataHunter
     {
       found: true,
       gtin: gtin,
-      status: (web_results_found?(web_data) ? "Found (Web Verified)" : "Registry Only"),
+      status: (web_data[:valid_urls].any? ? "Found (Web Verified)" : "Registry Only"),
       market: market,
       image_url: image_data ? image_data[:url] : nil,
       issuing_country: origin_country,
@@ -111,49 +108,106 @@ class MasterDataHunter
     URI.parse(url).host.sub(/^www\./, '') rescue "Link"
   end
 
-  def web_results_found?(web_data)
-    web_data && web_data[:valid_urls] && web_data[:valid_urls].any?
-  end
-
   # --- CORE SEARCH LOGIC ---
   def find_unified_sources(gtin, name, market)
-    return [] if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
-    
+    return [] if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
     goldmine = @goldmine_sites[market]
     
-    # 1. Base Bans to remove noise
-    bans = "-site:openfoodfacts.org -site:wikipedia.org -site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
+    # UNBANNED: OpenFoodFacts & Wikipedia (Crucial for data completeness)
+    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com -site:youtube.com"
 
     queries = []
-    
-    # Query A: The Sniper (EAN + Trusted Retailer)
-    # This finds the product page on Tesco, Rewe, Motatos directly.
+    # 1. Sniper: EAN + Retailer
     queries << "#{goldmine} #{gtin} #{bans}" if goldmine
-    
-    # Query B: The Broad Net (EAN + Keywords)
-    # This finds OpenFoodFacts, obscure blogs, or PDF datasheets.
+    # 2. Broad: EAN + Keywords
     queries << "#{gtin} ingredients nutrition #{bans}"
-    
-    # Query C: The Deep Search (Name + Keywords) - ONLY if we have a name
-    # This fixes the "EAN not found" issue by searching for the text name.
+    # 3. Deep: Name + Keywords (if Name exists)
     if name && name.length > 3
-      clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '') # Remove weird chars
+      clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
       queries << "#{clean_name} ingredients nutrition #{bans}"
     end
 
     urls = []
-    
-    # Execute searches (Limit to top 3 per query to save API calls/time)
     queries.each do |q|
       begin
         res = GoogleSearch.new(q: q, gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
         (res[:organic_results] || []).each { |r| urls << r[:link] }
       rescue; next; end
     end
-
-    # Return unique URLs, capping at 8 to prevent timeout during scraping
     urls.uniq.first(8)
+  end
+
+  # --- ROBUST IMAGE DOWNLOADER (THE FIX) ---
+  def find_best_image(gtin, market)
+    return nil if SERPAPI_KEY.nil?
+    gl = (market == "UK" ? "gb" : market.downcase)
+    
+    # 1. Search for images
+    res = GoogleSearch.new(q: "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
+    if (res[:images_results] || []).empty?
+      res = GoogleSearch.new(q: "#{gtin} product", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
+    end
+
+    images = (res[:images_results] || []).first(5)
+    return nil if images.empty?
+
+    # 2. Try to download (with Browser Headers to avoid blocking)
+    images.each do |img|
+      url = img[:original]
+      next if url.nil? || url.include?("placeholder")
+      
+      begin
+        # MASK AS A BROWSER (Mozilla/5.0) to bypass Amazon/Retailer blocks
+        tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 5, timeout_read: 10, headers: { "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
+        base64 = Base64.strict_encode64(File.read(tempfile.path))
+        return { url: url, source: img[:link], base64: base64 }
+      rescue; next; end
+    end
+
+    # 3. FALLBACK: If download fails, return the URL anyway (So User sees it, even if AI is blind)
+    first_valid = images.find { |i| !i[:original].include?("placeholder") }
+    return first_valid ? { url: first_valid[:original], source: first_valid[:link], base64: nil } : nil
+  end
+
+  # --- SCRAPER WITH HIGHER TIMEOUTS ---
+  def fetch_multi_page_data(urls)
+    return { text: "", valid_urls: [] } if urls.empty?
+
+    threads = []
+    results_text = []
+    valid_urls = []
+    
+    urls.each do |url|
+      threads << Thread.new do
+        begin
+          # Increased timeout to 10 seconds per site
+          Timeout.timeout(10) do
+            agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 8)
+            
+            if response.code == 200
+              doc = Nokogiri::HTML(response.body)
+              doc.css('script, style, nav, footer, iframe, header, .cookie, .advertisement').remove
+              
+              txt = doc.text.gsub(/\s+/, " ").strip[0..10000]
+              
+              json_ld = ""
+              doc.css('script[type="application/ld+json"]').each do |s| 
+                json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " 
+              end
+              
+              if txt.length > 50 # Only keep if we actually scraped content
+                valid_urls << url
+                results_text << "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
+              end
+            end
+          end
+        rescue; end
+      end
+    end
+    threads.each(&:join)
+    { text: results_text.join("\n"), valid_urls: valid_urls }
   end
 
   def fetch_official_ean_data(gtin)
@@ -165,79 +219,8 @@ class MasterDataHunter
     rescue; nil; end
   end
 
-  def find_best_image(gtin, market)
-    return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
-    gl = (market == "UK" ? "gb" : market.downcase)
-    
-    # 1. Search Strategy
-    res = GoogleSearch.new(q: "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
-    if (res[:images_results] || []).empty?
-      res = GoogleSearch.new(q: "#{gtin} product", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
-    end
-
-    images = (res[:images_results] || []).first(5)
-    return nil if images.empty?
-
-    # 2. Try to download for AI (Best Case)
-    images.each do |img|
-      url = img[:original]
-      next if url.nil? || url.include?("placeholder")
-      
-      begin
-        # Relaxed timeout and added User-Agent to bypass blocks
-        tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 5, timeout_read: 10, headers: { "User-Agent" => "Mozilla/5.0" })
-        base64 = Base64.strict_encode64(File.read(tempfile.path))
-        return { url: url, source: img[:link], base64: base64 }
-      rescue; next; end
-    end
-
-    # 3. FALLBACK: If all downloads fail, return the first URL anyway (for UI only)
-    first_valid = images.find { |i| !i[:original].include?("placeholder") }
-    return first_valid ? { url: first_valid[:original], source: first_valid[:link], base64: nil } : nil
-  end
-
-  def fetch_multi_page_data(urls)
-    return { text: "", valid_urls: [] } if urls.empty?
-
-    threads = []
-    results_text = []
-    valid_urls = []
-    
-    urls.each do |url|
-      threads << Thread.new do
-        begin
-          Timeout.timeout(6) do
-            agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 5)
-            
-            if response.code == 200
-              doc = Nokogiri::HTML(response.body)
-              # Remove noise
-              doc.css('script, style, nav, footer, iframe, header, .cookie, .advertisement').remove
-              
-              # Extract clean text
-              txt = doc.text.gsub(/\s+/, " ").strip[0..10000] # Cap at 10k chars per site
-              
-              # Extract JSON-LD (often contains structured ingredients)
-              json_ld = ""
-              doc.css('script[type="application/ld+json"]').each do |s| 
-                json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " 
-              end
-              
-              valid_urls << url
-              results_text << "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
-            end
-          end
-        rescue; end
-      end
-    end
-    threads.each(&:join)
-    { text: results_text.join("\n"), valid_urls: valid_urls }
-  end
-
   def analyze_with_gemini(base64_image, text_data, official, gtin, market)
     target_lang = @country_langs[market] || "English"
-    
     official_txt = official ? "OFFICIAL REGISTRY IDENTITY: #{official['name']}" : "OFFICIAL REGISTRY: None"
 
     prompt = <<~TEXT
@@ -246,25 +229,22 @@ class MasterDataHunter
       
       INPUT DATA:
       #{text_data}
-      #{base64_image ? "IMAGE: Provided" : "IMAGE: Not Found"}
+      #{base64_image ? "IMAGE: Provided (Use for OCR validation)" : "IMAGE: Download Failed (Rely on Text)"}
 
       MARKET REQUIREMENTS:
       - Target Market: #{market}
       - Target Languages: #{target_lang}
       
       TASK:
-      1. **Synthesize Data:** Combine the Scraped Text and Image.
-      2. **Conflict Resolution:** - If the Image is blurry/unreadable, **TRUST THE TEXT DATA**.
-         - If Text Data is missing ingredients, **TRUST THE IMAGE**.
-         - Ignore "cookies", "login", or "navigation" text.
-      3. **Translation:** Translate Name, Ingredients, and Allergens to **#{target_lang}**.
-      4. **BE Specific:** If Market is 'BE', output Ingredients/Allergens in German, French, AND Dutch.
-      5. **Nutrition:** Extract 100g/ml values. If missing, leave empty.
+      1. Synthesize all data. Use Text Data as primary, Image as secondary/validation.
+      2. **Translation:** Translate Name, Ingredients, and Allergens to **#{target_lang}**.
+      3. **BE Specific:** If Market is 'BE', output Ingredients/Allergens in German, French, AND Dutch.
+      4. **Nutrition:** Extract 100g/ml values.
       
       OUTPUT JSON (Strict Schema):
       {
         "brand": "Brand Name",
-        "product_name": "Name (Translated to #{target_lang})", 
+        "product_name": "Name (Translated)", 
         "net_weight": "Value (e.g. 500g)",
         "ingredients": "List (Translated)", 
         "allergens": "List (Translated)",
@@ -272,7 +252,7 @@ class MasterDataHunter
         "nutri_scope": "100g", "energy": "kJ/kcal", "fat": "val", "saturates": "val",
         "carbs": "val", "sugars": "val", "protein": "val", "fiber": "val", "salt": "val",
         "organic_id": "Code (e.g. DE-ÖKO-006)", 
-        "sources_summary": "Briefly state where data came from (e.g. 'Found on Motatos & Image')"
+        "sources_summary": "Short source description"
       }
     TEXT
 
@@ -318,7 +298,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v2.9 (Unified Search)</title>
+  <title>TGTG AI Hunter v3.0 (Robust)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -361,7 +341,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v2.9 (Unified Search)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.0 (Robust Fix)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
