@@ -29,7 +29,7 @@ class MasterDataHunter
       "BE" => "German, French, AND Dutch (Must provide all 3)"
     }
 
-    # 2. THE GOLDMINE
+    # 2. THE GOLDMINE (Prioritized Retailers)
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:openfoodfacts.org",
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:ocado.com",
@@ -64,14 +64,16 @@ class MasterDataHunter
     candidate_urls = search_result[:urls]
     inferred_name = search_result[:inferred_name] 
 
-    # Scrape with LOW TIMEOUT to prevent "Network Error"
+    # Scrape with STABLE TIMEOUT (7s)
     web_data = fetch_multi_page_data(candidate_urls)
     web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
 
-    # --- STEP 2.5: LOW QUALITY DATA RESCUE ---
-    # If we found links but the text is tiny (e.g. PicClick empty page), Force Deep Search
-    if web_data[:text].length < 300 && (registry_name || inferred_name)
-      rescue_name = registry_name || inferred_name
+    # --- STEP 2.5: DEEP RESCUE (Fixes "PicClick" issues) ---
+    # Trigger if we have NO text, OR if text is short (like PicClick), OR if we only found generic sites
+    has_good_data = web_data[:text].length > 500
+    rescue_name = registry_name || inferred_name
+    
+    if !has_good_data && rescue_name
       deep_urls = find_deep_sources(rescue_name, market)
       deep_data = fetch_multi_page_data(deep_urls)
       
@@ -87,12 +89,11 @@ class MasterDataHunter
     end
 
     # --- STEP 4: AI ANALYSIS ---
-    # Fail fast only if truly blind
+    # Fail fast only if truly blind (No Text AND No Image)
     if (image_data.nil? || image_data[:base64].nil?) && web_data[:text].strip.empty?
       return empty_result(gtin, market, "No Data Found (Blind)", nil)
     end
 
-    # Pass the Inferred Name to AI if Official Name is missing
     final_name_context = official_data ? official_data : { 'name' => inferred_name }
 
     ai_result = analyze_with_gemini(
@@ -108,14 +109,12 @@ class MasterDataHunter
     end
 
     origin_country = official_data ? official_data['issuingCountry'] : nil
-
-    # USE BASE64 FOR FRONTEND DISPLAY if available (Bypasses Hotlink Protection)
     display_image = image_data && image_data[:base64] ? "data:image/jpeg;base64,#{image_data[:base64]}" : (image_data ? image_data[:url] : nil)
 
     {
       found: true,
       gtin: gtin,
-      status: (web_data[:text].length > 100 ? "Found (Web Verified)" : "Registry Only"),
+      status: (web_data[:text].length > 100 ? "Found (Verified)" : "Registry Only"),
       market: market,
       image_url: display_image, 
       issuing_country: origin_country,
@@ -137,13 +136,11 @@ class MasterDataHunter
     goldmine = @goldmine_sites[market]
     
     bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com -site:youtube.com"
-
     urls = []
     inferred_name = nil
 
     # Query 1: EAN on Trusted Retailers
     q1 = "#{goldmine} #{gtin} #{bans}" if goldmine
-    
     # Query 2: Broad EAN Search
     q2 = "#{gtin} #{bans}" 
 
@@ -161,7 +158,6 @@ class MasterDataHunter
         end
       rescue; next; end
     end
-
     { urls: urls.uniq.first(6), inferred_name: inferred_name }
   end
 
@@ -181,7 +177,7 @@ class MasterDataHunter
     urls
   end
 
-  # --- IMAGE DOWNLOADER (Base64 Priority) ---
+  # --- IMAGE DOWNLOADER (Robust) ---
   def find_best_image(gtin, market)
     return nil if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
@@ -204,25 +200,21 @@ class MasterDataHunter
 
     return nil if images.empty?
 
-    # Try to download max 2 images to find a working one
     images.first(2).each do |img|
       url = img[:original]
       next if url.nil? || url.include?("placeholder")
-      
       begin
-        # Mask as Browser
-        tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 4, timeout_read: 6, headers: { "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
+        # 6s Timeout for image download
+        tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 5, timeout_read: 6, headers: { "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
         base64 = Base64.strict_encode64(File.read(tempfile.path))
         return { url: url, source: img[:link], base64: base64 }
       rescue; next; end
     end
-
-    # Fallback: Return URL even if download failed
     first_valid = images.find { |i| !i[:original].include?("placeholder") }
     return first_valid ? { url: first_valid[:original], source: first_valid[:link], base64: nil } : nil
   end
 
-  # --- SCRAPER (Optimized for Speed) ---
+  # --- SCRAPER (The Stability Fix) ---
   def fetch_multi_page_data(urls)
     return { text: "", valid_urls: [] } if urls.empty?
 
@@ -232,11 +224,11 @@ class MasterDataHunter
     
     urls.each do |url|
       threads << Thread.new do
+        # CRITICAL FIX: Wrap everything in begin/rescue so ONE failure doesn't crash the loop
         begin
-          # TIMEOUT REDUCED to 4s to prevent Server Error
-          Timeout.timeout(5) do
+          Timeout.timeout(7) do # 7s timeout (Balanced)
             agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 4)
+            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 6)
             
             if response.code == 200
               doc = Nokogiri::HTML(response.body)
@@ -247,15 +239,26 @@ class MasterDataHunter
               doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
               
               if txt.length > 50
-                valid_urls << url
-                results_text << "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
+                # Thread-safe array appending
+                Thread.current[:valid] = url
+                Thread.current[:text] = "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
               end
             end
           end
-        rescue; end
+        rescue => e
+          # Silently fail for this specific URL, allowing others to succeed
+        end
       end
     end
-    threads.each(&:join)
+
+    threads.each do |t| 
+      t.join
+      if t[:valid]
+        valid_urls << t[:valid]
+        results_text << t[:text]
+      end
+    end
+    
     { text: results_text.join("\n"), valid_urls: valid_urls }
   end
 
@@ -352,7 +355,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v3.2 (Speed+Vis)</title>
+  <title>TGTG AI Hunter v3.3 (Stable)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -396,7 +399,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.2 (Speed+Vis)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.3 (Stable)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
