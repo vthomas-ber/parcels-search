@@ -287,7 +287,7 @@ class MasterDataHunter
         begin
           tempfile = Down.download(
             url, 
-            max_size: (1.5 * 1024 * 1024).to_i,
+            max_size: (4 * 1024 * 1024).to_i,
             timeout: 6,
             open_timeout: 4, 
             read_timeout: 4, 
