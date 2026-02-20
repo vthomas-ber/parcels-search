@@ -88,7 +88,7 @@ class MasterDataHunter
     end
 
     # Wait for all searches to finish (Max 5 seconds wait)
-    threads.each { |t| t.join(5) }
+    threads.each(&:join)
 
     # Combine URLs (Retailer First, then Deep)
     all_urls = (retailer_results + deep_results).uniq.first(5) # Cap at 5 total URLs to scrape
@@ -202,7 +202,7 @@ class MasterDataHunter
         next if url.nil? || url.include?("placeholder")
         begin
           # Strict 4s timeout
-          tempfile = Down.download(url, max_size: 5 * 1024 * 1024, timeout_open: 4, timeout_read: 4, headers: { "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
+          tempfile = Down.download(url, max_size: 1 * 1024 * 1024, timeout_open: 4, timeout_read: 4, headers: { "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" })
           base64 = Base64.strict_encode64(File.read(tempfile.path))
           return { url: url, source: img[:link], base64: base64 }
         rescue; next; end
