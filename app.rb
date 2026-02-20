@@ -6,12 +6,20 @@ require 'json'
 require 'base64'
 require 'httparty'
 require 'nokogiri'
-require 'time' # For ISO8601 logging
+require 'time'
+require 'uri'
+require 'timeout'
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY     = ENV['GEMINI_API_KEY']
 SERPAPI_KEY        = ENV['SERPAPI_KEY']
 EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN']
+
+BAD_URL_PATTERNS = %w[rezept recipe kuchen torta blog forum pinterest wiki tiktok facebook instagram].freeze
+ALLOWED_KEYS = %w[
+  brand product_name net_weight ingredients allergens may_contain nutri_scope
+  energy fat saturates carbs sugars protein fiber salt organic_id sources_summary
+].freeze
 
 class MasterDataHunter
   include HTTParty
@@ -29,21 +37,22 @@ class MasterDataHunter
       "BE" => "German, French, AND Dutch (Must provide all 3)"
     }
 
-    # 2. THE GOLDMINE (Retailers)
-    @goldmine_sites = {
-      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:openfoodfacts.org",
-      "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:ocado.com",
-      "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl",
-      "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be",
-      "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:motatos.de OR site:picnic.app",
-      "AT" => "site:billa.at OR site:spar.at OR site:gurkerl.at OR site:motatos.at",
-      "DK" => "site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk OR site:netto.dk",
-      "IT" => "site:carrefour.it OR site:conad.it OR site:coop.it",
-      "ES" => "site:carrefour.es OR site:mercadona.es OR site:dia.es",
-      "SE" => "site:ica.se OR site:coop.se OR site:willys.se OR site:matsmart.se",
-      "NO" => "site:oda.com OR site:meny.no OR site:holdbart.no",
-      "FI" => "site:k-ruoka.fi OR site:s-kaupat.fi OR site:matsmart.fi",
-      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl"
+    # 2. Localized Search Terms
+    @local_search_terms = {
+      "FR" => "ingrédients nutrition", "IT" => "ingredienti nutrizionali", "ES" => "ingredientes nutrición",
+      "NL" => "ingrediënten voedingswaarde", "DK" => "ingredienser næringsindhold", "SE" => "ingredienser näringsvärde",
+      "NO" => "ingredienser næringsinnhold", "FI" => "ainesosat ravintosisältö", "PL" => "składniki wartości odżywcze",
+      "DE" => "zutaten nährwerte", "AT" => "zutaten nährwerte", "CH" => "zutaten nährwerte",
+      "BE" => "ingrédients ingrediënten", "UK" => "ingredients nutrition", "PT" => "ingredientes nutrição"
+    }
+
+    # 3. Country Names for Strict Image Hunting
+    @country_names = {
+      "DE" => "Deutschland Germany", "AT" => "Österreich Austria", "CH" => "Schweiz Switzerland",
+      "UK" => "UK United Kingdom",   "GB" => "UK United Kingdom", "FR" => "France",
+      "IT" => "Italia Italy", "ES" => "España Spain", "PL" => "Polska Poland",
+      "DK" => "Danmark Denmark", "NL" => "Nederland Netherlands", "BE" => "Belgique België Belgium",
+      "SE" => "Sverige Sweden", "NO" => "Norge Norway", "PT" => "Portugal", "FI" => "Suomi Finland"
     }
   end
 
@@ -52,7 +61,7 @@ class MasterDataHunter
 
     confirmed_sources = []
     
-    # --- STEP 1: OFFICIAL REGISTRY (Fast) ---
+    # --- STEP 1: OFFICIAL REGISTRY ---
     official_data = fetch_official_ean_data(gtin)
     registry_name = official_data ? official_data['name'] : nil
     if official_data
@@ -62,35 +71,27 @@ class MasterDataHunter
     # --- STEP 2: PARALLEL SEARCH EXECUTION ---
     threads = []
     
-    # Task A: Retailer Search
     retailer_results = []
-    threads << Thread.new do
-      retailer_results = find_retailer_urls(gtin, market)
-    end
+    threads << Thread.new { retailer_results = find_retailer_urls(gtin, market) }
 
-    # Task B: Deep Search
     deep_results = []
     threads << Thread.new do
       search_name = registry_name || infer_name_from_ean(gtin, market)
       deep_results = find_deep_urls(search_name, market) if search_name
     end
 
-    # Task C: Image Search
     image_data = nil
-    threads << Thread.new do
-      image_data = find_best_image(gtin, market)
-    end
+    image_thread = Thread.new { image_data = find_best_image(gtin, market, official_data) }
 
-    # Wait safely: Absolute deadline of 9 seconds, then kill stragglers
-    deadline = Time.now + 9
+    # Thread Synchronization Guard (Extended to 25s for higher yield)
+    deadline = Time.now + 25
+    image_thread.join([deadline - Time.now, 0].max) if image_thread.alive?
     threads.each do |t|
       remaining = deadline - Time.now
-      break if remaining <= 0
-      t.join(remaining)
+      t.join(remaining > 0 ? remaining : 0.1)
     end
-    threads.each { |t| t.kill if t.alive? }
+    (threads + [image_thread]).each { |t| t.kill if t.alive? }
 
-    # Combine URLs
     all_urls = (retailer_results + deep_results).uniq.first(5)
 
     # --- STEP 3: PARALLEL SCRAPING ---
@@ -101,38 +102,33 @@ class MasterDataHunter
       confirmed_sources << { type: "image", title: "Source Image", url: image_data[:url] }
     end
 
-    # --- STEP 4: AI ANALYSIS ---
+    # Fail fast if blind
     if (image_data.nil? || image_data[:base64].nil?) && web_data[:text].strip.empty?
       return empty_result(gtin, market, "No Data Found (Blind)", nil)
     end
 
     final_name_context = official_data ? official_data : { 'name' => registry_name }
 
-    ai_result = analyze_with_gemini(
-      image_data, 
-      web_data[:text], 
-      final_name_context, 
-      gtin, 
-      market
-    )
+    # --- STEP 4: AI ANALYSIS ---
+    ai_result = analyze_with_gemini(image_data, web_data[:text], final_name_context, gtin, market)
+    
+    ai_hash = {}
+    if ai_result.is_a?(Hash)
+      ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result[k] if ai_result.key?(k) }
+      ai_hash["error"] = ai_result["error"] if ai_result["error"]
+    end
 
-    # Clean the keys to symbols to prevent Ruby 3 splat/merge errors
-    ai_hash = ai_result.is_a?(Hash) ? ai_result.transform_keys(&:to_sym) : {}
-
-    if ai_hash[:error]
-      return empty_result(gtin, market, ai_hash[:error], image_data ? image_data[:url] : nil)
+    if ai_hash["error"]
+      return empty_result(gtin, market, ai_hash["error"], image_data ? image_data[:url] : nil)
     end
 
     origin_country = official_data ? official_data['issuingCountry'] : nil
-    
-    # Construct proper display image URI with the true MIME type
     display_image = if image_data && image_data[:base64] && image_data[:mime]
                       "data:#{image_data[:mime]};base64,#{image_data[:base64]}"
                     else
                       image_data ? image_data[:url] : nil
                     end
 
-    # Safely merge hashes
     {
       found: true,
       gtin: gtin,
@@ -164,13 +160,16 @@ class MasterDataHunter
     end
   end
 
-  # --- SEARCH METHODS ---
-  
+  def is_clean_url?(url)
+    return false if url.nil?
+    !BAD_URL_PATTERNS.any? { |p| url.downcase.include?(p) }
+  end
+
   def infer_name_from_ean(gtin, market)
     return nil if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
     begin
-      res = GoogleSearch.new(q: "#{gtin}", gl: gl, num: 2, api_key: SERPAPI_KEY).get_hash
+      res = Timeout.timeout(15) { GoogleSearch.new(q: "#{gtin}", gl: gl, num: 2, api_key: SERPAPI_KEY).get_hash }
       first_result = (res[:organic_results] || []).first
       return first_result[:title].split(/ [|-] /).first.strip if first_result
     rescue => e
@@ -182,14 +181,11 @@ class MasterDataHunter
   def find_retailer_urls(gtin, market)
     return [] if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
-    goldmine = @goldmine_sites[market]
     bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:youtube.com"
-    return [] unless goldmine
-    
     urls = []
     begin
-      res = GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
-      (res[:organic_results] || []).each { |r| urls << r[:link] }
+      res = Timeout.timeout(15) { GoogleSearch.new(q: "#{gtin} product #{bans}", gl: gl, num: 5, api_key: SERPAPI_KEY).get_hash }
+      (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
     rescue => e
       log("Search API error (retailers): #{e.message}")
     end
@@ -201,64 +197,109 @@ class MasterDataHunter
     gl = (market == "UK" ? "gb" : market.downcase)
     bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
     clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
+    local_terms = @local_search_terms[market] || "ingredients nutrition"
     
     urls = []
     begin
-      res = GoogleSearch.new(q: "#{clean_name} ingredients nutrition #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
-      (res[:organic_results] || []).each { |r| urls << r[:link] }
+      res = Timeout.timeout(15) { GoogleSearch.new(q: "\"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 4, api_key: SERPAPI_KEY).get_hash }
+      (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
     rescue => e
       log("Search API error (deep links): #{e.message}")
     end
-    urls
+    urls.first(3)
   end
 
-  # --- IMAGE DOWNLOADER ---
-  def find_best_image(gtin, market)
-    return nil if SERPAPI_KEY.nil?
+  # --- ULTIMATE 5-TIER IMAGE DOWNLOADER ---
+  def find_best_image(gtin, market, official_data)
+    return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = (market == "UK" ? "gb" : market.downcase)
-    bans = "-site:openfoodfacts.org"
+    hl = @country_langs[market] || "en"
+    country_name = @country_names[market] || ""
 
-    begin
-      res = GoogleSearch.new(q: "#{gtin} product #{bans}", tbm: "isch", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
-      images = (res[:images_results] || []).first(3) 
-      
-      images.each do |img|
-        url = img[:original]
-        next if url.nil? || url.include?("placeholder")
-        
-        begin
-          tempfile = Down.download(
-            url, 
-            max_size: 1.5 * 1024 * 1024, # Cap at 1.5MB to save frontend render
-            open_timeout: 4, 
-            read_timeout: 4, 
-            headers: { 
-              "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-              "Accept" => "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-              "Referer" => (img[:link] || "https://www.google.com/")
-            }
-          )
-          
-          # Validate actual image type
-          type = FastImage.type(tempfile.path)
-          mime = mime_from_fastimage(type)
-          
-          unless mime
-            log("IMG skip url=#{url} reason=Not an image block (type: #{type.inspect})")
-            next
-          end
-
-          base64 = Base64.strict_encode64(File.binread(tempfile.path))
-          return { url: url, source: img[:link], base64: base64, mime: mime }
-          
-        rescue => e
-          log("IMG fail url=#{url} err=#{e.class}: #{e.message}")
-          next
-        end
-      end
-    rescue => e
-      log("IMG SerpAPI fail: #{e.message}")
+    # Attempt 1: Official Registry Image
+    if official_data && is_good_image_size?(official_data['image'])
+      log("IMG found in Official Registry for #{gtin}")
+      encoded = download_and_encode(official_data['image'], "https://www.ean-search.org/?q=#{gtin}")
+      return encoded if encoded
     end
+
+    # Define the Search Cascades
+    searches = [
+      "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", # Attempt 2: Targeted
+      "\"#{gtin}\" #{country_name}",                         # Attempt 3: Strict
+      "\"#{gtin}\""                                          # Attempt 4: Broad
+    ]
+    
+    # Attempt 5: Name Search (if available)
+    if official_data && official_data['name']
+      clean_name = official_data['name'].gsub(/[^a-zA-Z0-9\s]/, '')
+      searches << clean_name if clean_name.length > 3
+    end
+
+    searches.each_with_index do |query, index|
+      begin
+        res = Timeout.timeout(10) { GoogleSearch.new(q: query, tbm: "isch", gl: gl, hl: hl, api_key: SERPAPI_KEY).get_hash }
+        images = (res[:images_results] || []).first(10)
+        
+        images.each do |img|
+          url = img[:original]
+          next if url.nil? || url.include?("placeholder")
+          next if url.include?("pinterest") || url.include?("ebay") || url.include?("openfoodfacts")
+          
+          # Use FastImage to check aspect ratio and size before heavily downloading
+          if is_good_image_size?(url)
+            encoded = download_and_encode(url, img[:link])
+            if encoded
+              log("IMG success=true on attempt #{index+2} for #{url}")
+              return encoded
+            end
+          end
+        end
+      rescue => e
+        log("IMG SerpAPI fail on query '#{query}': #{e.message}")
+      end
+    end
+    nil
+  end
+
+  def is_good_image_size?(url)
+    return false if url.nil? || url.empty?
+    begin
+      size = Timeout.timeout(4) { FastImage.size(url, timeout: 3, http_header: { 'User-Agent' => 'Mozilla/5.0' }) }
+      return false unless size
+      w, h = size
+      # Must be wide enough, and aspect ratio (width/height) between 0.3 (tall) and 2.5 (wide)
+      w > 300 && (w.to_f / h.to_f).between?(0.3, 2.5)
+    rescue
+      false
+    end
+  end
+
+  def download_and_encode(url, source_link)
+    tempfile = Down.download(
+      url, 
+      max_size: 1.5 * 1024 * 1024,
+      open_timeout: 4, 
+      read_timeout: 4, 
+      headers: { 
+        "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept" => "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer" => (source_link || "https://www.google.com/")
+      }
+    )
+    
+    type = FastImage.type(tempfile.path)
+    mime = mime_from_fastimage(type)
+    
+    unless mime
+      log("IMG skip url=#{url} reason=Not an image block (type: #{type.inspect})")
+      return nil
+    end
+
+    base64 = Base64.strict_encode64(File.binread(tempfile.path))
+    { url: url, source: source_link, base64: base64, mime: mime }
+  rescue => e
+    log("IMG download fail url=#{url} err=#{e.class}: #{e.message}")
     nil
   end
 
@@ -274,7 +315,6 @@ class MasterDataHunter
       threads << Thread.new do
         begin
           agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-          # HTTParty natively handles timeouts, no need for the dangerous Timeout.timeout block
           response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 6)
           
           if response.code == 200
@@ -285,7 +325,7 @@ class MasterDataHunter
             json_ld = ""
             doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
             
-            doc = nil # Explicitly free memory for Ruby GC
+            doc = nil 
             
             if txt.length > 200
               Thread.current[:valid] = url
@@ -300,7 +340,6 @@ class MasterDataHunter
       end
     end
 
-    # Wait for all safely capped HTTP requests to finish
     threads.each(&:join)
 
     threads.each do |t| 
@@ -366,7 +405,6 @@ class MasterDataHunter
     models = ["models/gemini-2.0-flash", "models/gemini-2.0-flash-lite", "models/gemini-1.5-flash"]
     parts = [{ text: prompt }]
     
-    # Use dynamic MIME type instead of hardcoded jpeg
     if image_data && image_data[:base64] && image_data[:mime]
       parts << { inline_data: { mime_type: image_data[:mime], data: image_data[:base64] } }
     end
@@ -385,7 +423,7 @@ class MasterDataHunter
         next 
       end
     end
-    { error: "AI Failed to Analyze" }
+    { "error" => "AI Failed to Analyze" }
   end
 
   def empty_result(gtin, market, msg, img)
@@ -417,7 +455,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v3.6 (Parallel)</title>
+  <title>TGTG AI Hunter v4.0 (The Ultimate Synthesis)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -461,7 +499,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.6 (Parallel)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v4.0 (The Ultimate Synthesis)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -576,10 +614,11 @@ __END__
         sourcesHTML += `</div>`;
         
         const fmt = (val) => {
-  if (!val) return "-";
-  if (Array.isArray(val)) val = val.join(', ');
-  if (typeof val === 'object') val = JSON.stringify(val);
-  return String(val).replace(/\n/g, "<br>");};
+          if (!val) return "-";
+          if (Array.isArray(val)) val = val.join(', ');
+          if (typeof val === 'object') val = JSON.stringify(val);
+          return String(val).replace(/\n/g, "<br>");
+        };
 
         tr.innerHTML = `
           <td><span class="status-badge ${sClass}">${data.status}</span></td>
@@ -606,6 +645,7 @@ __END__
         `;
         resultsData.push(data);
       } catch (e) {
+        console.error(`Frontend crashed on EAN ${gtin}:`, e);
         tr.innerHTML = `<td colspan="20" style="color:red; text-align:center;">Network/Server Error for ${gtin}</td>`;
       }
       processed++;
