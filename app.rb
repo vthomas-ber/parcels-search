@@ -6,12 +6,19 @@ require 'json'
 require 'base64'
 require 'httparty'
 require 'nokogiri'
-require 'time' # For ISO8601 logging
+require 'time'
+require 'uri' # Fix 1: Required for reliable URL parsing in host_from_url
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY     = ENV['GEMINI_API_KEY']
 SERPAPI_KEY        = ENV['SERPAPI_KEY']
 EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN']
+
+# Fix 3: Strict Whitelist for AI Keys to prevent memory bloat and hash merge crashes
+ALLOWED_KEYS = %w[
+  brand product_name net_weight ingredients allergens may_contain nutri_scope
+  energy fat saturates carbs sugars protein fiber salt organic_id sources_summary
+].freeze
 
 class MasterDataHunter
   include HTTParty
@@ -59,36 +66,32 @@ class MasterDataHunter
       confirmed_sources << { type: "registry", title: "Official Registry", url: "https://www.ean-search.org/?q=#{gtin}" }
     end
 
-    # --- STEP 2: PARALLEL SEARCH EXECUTION ---
-    threads = []
-    
-    # Task A: Retailer Search
+    # --- STEP 2: PARALLEL SEARCH EXECUTION (Decoupled & Prioritized) ---
+    image_data = nil
     retailer_results = []
-    threads << Thread.new do
-      retailer_results = find_retailer_urls(gtin, market)
-    end
-
-    # Task B: Deep Search
     deep_results = []
-    threads << Thread.new do
+
+    image_thread = Thread.new { image_data = find_best_image(gtin, market) }
+    retailer_thread = Thread.new { retailer_results = find_retailer_urls(gtin, market) }
+    deep_thread = Thread.new do
       search_name = registry_name || infer_name_from_ean(gtin, market)
       deep_results = find_deep_urls(search_name, market) if search_name
     end
 
-    # Task C: Image Search
-    image_data = nil
-    threads << Thread.new do
-      image_data = find_best_image(gtin, market)
+    # Fix 5: Prioritize joining the image thread so it isn't starved by slow deep searches
+    deadline = Time.now + 9
+    
+    # Wait for image first
+    image_thread.join([deadline - Time.now, 0].max) if image_thread.alive?
+    
+    # Then wait for the rest with remaining time
+    [retailer_thread, deep_thread].each do |t|
+      remaining = deadline - Time.now
+      t.join(remaining) if remaining > 0 && t.alive?
     end
 
-    # Wait safely: Absolute deadline of 9 seconds, then kill stragglers
-    deadline = Time.now + 9
-    threads.each do |t|
-      remaining = deadline - Time.now
-      break if remaining <= 0
-      t.join(remaining)
-    end
-    threads.each { |t| t.kill if t.alive? }
+    # Kill any stragglers
+    [image_thread, retailer_thread, deep_thread].each { |t| t.kill if t.alive? }
 
     # Combine URLs
     all_urls = (retailer_results + deep_results).uniq.first(5)
@@ -103,40 +106,88 @@ class MasterDataHunter
 
     # --- STEP 4: AI ANALYSIS ---
     if (image_data.nil? || image_data[:base64].nil?) && web_data[:text].strip.empty?
-      return empty_result(gtin, market, "No Data Found (Blind)", nil)
+      return empty_result(gtin, market, "Blind", nil)
     end
 
     final_name_context = official_data ? official_data : { 'name' => registry_name }
 
-    ai_result = analyze_with_gemini(
-      image_data, 
-      web_data[:text], 
-      final_name_context, 
-      gtin, 
-      market
-    )
+    ai_result = analyze_with_gemini(image_data, web_data[:text], final_name_context, gtin, market)
 
-    # Clean the keys to symbols to prevent Ruby 3 splat/merge errors
-    ai_hash = ai_result.is_a?(Hash) ? ai_result.transform_keys(&:to_sym) : {}
+    # Clean Whitelist Mapping (No Symbolization)
+    ai_hash = {}
+    if ai_result.is_a?(Hash)
+      ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result[k] if ai_result.key?(k) }
+      ai_hash["error"] = ai_result["error"] if ai_result["error"]
+    end
 
-    if ai_hash[:error]
-      return empty_result(gtin, market, ai_hash[:error], image_data ? image_data[:url] : nil)
+    if ai_hash["error"]
+      return empty_result(gtin, market, ai_hash["error"], image_data ? image_data[:url] : nil)
+    end
+
+    # --- FIX 9: FALLBACK ESCALATION (v2.7 Logic) ---
+    if ai_hash["ingredients"].nil? || ai_hash["ingredients"].to_s.length < 10
+      log("Fallback Escalation triggered for #{gtin}: Missing/short ingredients.")
+      
+      search_name = ai_hash["product_name"] || registry_name || infer_name_from_ean(gtin, market)
+      
+      if search_name
+        fallback_urls = find_deep_urls(search_name, market)
+        
+        if fallback_urls.any?
+          fallback_web_data = fetch_parallel_page_data(fallback_urls)
+          
+          if fallback_web_data[:text].length > 200
+            combined_text = web_data[:text] + "\n" + fallback_web_data[:text]
+            fallback_web_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
+            
+            # Re-run AI with richer text
+            ai_result2 = analyze_with_gemini(image_data, combined_text, final_name_context, gtin, market)
+            
+            if ai_result2.is_a?(Hash) && !ai_result2["error"]
+              ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result2[k] if ai_result2.key?(k) }
+            end
+            
+            # Update web state for status calculation
+            web_data[:valid_urls] += fallback_web_data[:valid_urls]
+            web_data[:text] = combined_text
+          end
+        end
+      end
     end
 
     origin_country = official_data ? official_data['issuingCountry'] : nil
-    
-    # Construct proper display image URI with the true MIME type
     display_image = if image_data && image_data[:base64] && image_data[:mime]
                       "data:#{image_data[:mime]};base64,#{image_data[:base64]}"
                     else
                       image_data ? image_data[:url] : nil
                     end
 
-    # Safely merge hashes
+    # --- FIX 4: EVIDENCE-BASED STATUS LOGIC ---
+    has_registry = !!official_data
+    has_image = image_data && image_data[:base64]
+    has_web = web_data[:valid_urls].any? && web_data[:text].length > 200
+
+    computed_status = if has_registry && has_web && has_image
+                        "Found (Registry+Web+Image)"
+                      elsif has_web && has_image
+                        "Found (Web+Image)"
+                      elsif has_web
+                        "Found (Web)"
+                      elsif has_image && has_registry
+                        "Found (Registry+Image)"
+                      elsif has_image
+                        "Found (Image)"
+                      elsif has_registry
+                        "Registry Only"
+                      else
+                        "Blind"
+                      end
+
+    # Return safe merged hash
     {
       found: true,
       gtin: gtin,
-      status: (web_data[:text].length > 100 ? "Found (Verified)" : "Registry Only"),
+      status: computed_status,
       market: market,
       image_url: display_image, 
       issuing_country: origin_country,
@@ -199,7 +250,7 @@ class MasterDataHunter
   def find_deep_urls(name, market)
     return [] if name.nil? || name.length < 3
     gl = (market == "UK" ? "gb" : market.downcase)
-    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
+    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com -site:openfoodfacts.org"
     clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
     
     urls = []
@@ -227,11 +278,15 @@ class MasterDataHunter
         next if url.nil? || url.include?("placeholder")
         
         begin
+          # Fix 2: Redundant timeout keys so it never hangs regardless of backend adapter
           tempfile = Down.download(
             url, 
-            max_size: 1.5 * 1024 * 1024, # Cap at 1.5MB to save frontend render
+            max_size: (1.5 * 1024 * 1024).to_i,
+            timeout: 6,
             open_timeout: 4, 
             read_timeout: 4, 
+            timeout_open: 4,
+            timeout_read: 4,
             headers: { 
               "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
               "Accept" => "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
@@ -239,7 +294,6 @@ class MasterDataHunter
             }
           )
           
-          # Validate actual image type
           type = FastImage.type(tempfile.path)
           mime = mime_from_fastimage(type)
           
@@ -274,7 +328,6 @@ class MasterDataHunter
       threads << Thread.new do
         begin
           agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-          # HTTParty natively handles timeouts, no need for the dangerous Timeout.timeout block
           response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 6)
           
           if response.code == 200
@@ -285,7 +338,7 @@ class MasterDataHunter
             json_ld = ""
             doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
             
-            doc = nil # Explicitly free memory for Ruby GC
+            doc = nil # Free memory
             
             if txt.length > 200
               Thread.current[:valid] = url
@@ -300,7 +353,6 @@ class MasterDataHunter
       end
     end
 
-    # Wait for all safely capped HTTP requests to finish
     threads.each(&:join)
 
     threads.each do |t| 
@@ -366,7 +418,6 @@ class MasterDataHunter
     models = ["models/gemini-2.0-flash", "models/gemini-2.0-flash-lite", "models/gemini-1.5-flash"]
     parts = [{ text: prompt }]
     
-    # Use dynamic MIME type instead of hardcoded jpeg
     if image_data && image_data[:base64] && image_data[:mime]
       parts << { inline_data: { mime_type: image_data[:mime], data: image_data[:base64] } }
     end
@@ -385,7 +436,7 @@ class MasterDataHunter
         next 
       end
     end
-    { error: "AI Failed to Analyze" }
+    { "error" => "AI Failed to Analyze" }
   end
 
   def empty_result(gtin, market, msg, img)
@@ -417,7 +468,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v3.6 (Parallel)</title>
+  <title>TGTG AI Hunter v3.7 (Hardened)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -461,7 +512,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.6 (Parallel)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.7 (Hardened)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -575,11 +626,13 @@ __END__
         }
         sourcesHTML += `</div>`;
         
+        // JS Error Fix: Handle Arrays and Objects dynamically before using string replace
         const fmt = (val) => {
-  if (!val) return "-";
-  if (Array.isArray(val)) val = val.join(', ');
-  if (typeof val === 'object') val = JSON.stringify(val);
-  return String(val).replace(/\n/g, "<br>");};
+          if (!val) return "-";
+          if (Array.isArray(val)) val = val.join(', ');
+          if (typeof val === 'object') val = JSON.stringify(val);
+          return String(val).replace(/\n/g, "<br>");
+        };
 
         tr.innerHTML = `
           <td><span class="status-badge ${sClass}">${data.status}</span></td>
@@ -606,6 +659,7 @@ __END__
         `;
         resultsData.push(data);
       } catch (e) {
+        console.error(`Frontend crashed on EAN ${gtin}:`, e); // Logs frontend JS errors directly to browser console
         tr.innerHTML = `<td colspan="20" style="color:red; text-align:center;">Network/Server Error for ${gtin}</td>`;
       }
       processed++;
