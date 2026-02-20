@@ -7,14 +7,14 @@ require 'base64'
 require 'httparty'
 require 'nokogiri'
 require 'time'
-require 'uri' # Fix 1: Required for reliable URL parsing in host_from_url
+require 'uri'
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY     = ENV['GEMINI_API_KEY']
 SERPAPI_KEY        = ENV['SERPAPI_KEY']
 EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN']
 
-# Fix 3: Strict Whitelist for AI Keys to prevent memory bloat and hash merge crashes
+# Strict Whitelist for AI Keys to prevent memory bloat and hash merge crashes
 ALLOWED_KEYS = %w[
   brand product_name net_weight ingredients allergens may_contain nutri_scope
   energy fat saturates carbs sugars protein fiber salt organic_id sources_summary
@@ -58,6 +58,7 @@ class MasterDataHunter
     return { found: false, status: "Missing GEMINI_API_KEY" } if GEMINI_API_KEY.nil? || GEMINI_API_KEY.empty?
 
     confirmed_sources = []
+    is_deep_search = false
     
     # --- STEP 1: OFFICIAL REGISTRY (Fast) ---
     official_data = fetch_official_ean_data(gtin)
@@ -78,22 +79,18 @@ class MasterDataHunter
       deep_results = find_deep_urls(search_name, market) if search_name
     end
 
-    # Fix 5: Prioritize joining the image thread so it isn't starved by slow deep searches
+    # Prioritize joining the image thread so it isn't starved
     deadline = Time.now + 9
     
-    # Wait for image first
     image_thread.join([deadline - Time.now, 0].max) if image_thread.alive?
     
-    # Then wait for the rest with remaining time
     [retailer_thread, deep_thread].each do |t|
       remaining = deadline - Time.now
       t.join(remaining) if remaining > 0 && t.alive?
     end
 
-    # Kill any stragglers
     [image_thread, retailer_thread, deep_thread].each { |t| t.kill if t.alive? }
 
-    # Combine URLs
     all_urls = (retailer_results + deep_results).uniq.first(5)
 
     # --- STEP 3: PARALLEL SCRAPING ---
@@ -124,20 +121,22 @@ class MasterDataHunter
       return empty_result(gtin, market, ai_hash["error"], image_data ? image_data[:url] : nil)
     end
 
-    # --- FIX 9: FALLBACK ESCALATION (v2.7 Logic) ---
-    if ai_hash["ingredients"].nil? || ai_hash["ingredients"].to_s.length < 10
-      log("Fallback Escalation triggered for #{gtin}: Missing/short ingredients.")
+    # --- STEP 5: THE v2.7 FALLBACK ESCALATION ---
+    ing_text = ai_hash["ingredients"].to_s.downcase
+    if ing_text.length < 10 || ing_text.include?("keine") || ing_text.include?("not found")
+      log("Fallback Escalation triggered for #{gtin}: Missing/poor ingredients.")
       
       search_name = ai_hash["product_name"] || registry_name || infer_name_from_ean(gtin, market)
       
-      if search_name
+      if search_name && search_name.length > 3 && !search_name.include?("Webdaten")
         fallback_urls = find_deep_urls(search_name, market)
         
         if fallback_urls.any?
           fallback_web_data = fetch_parallel_page_data(fallback_urls)
           
           if fallback_web_data[:text].length > 200
-            combined_text = web_data[:text] + "\n" + fallback_web_data[:text]
+            is_deep_search = true
+            combined_text = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_web_data[:text]
             fallback_web_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
             
             # Re-run AI with richer text
@@ -162,12 +161,14 @@ class MasterDataHunter
                       image_data ? image_data[:url] : nil
                     end
 
-    # --- FIX 4: EVIDENCE-BASED STATUS LOGIC ---
+    # --- EVIDENCE-BASED STATUS LOGIC ---
     has_registry = !!official_data
     has_image = image_data && image_data[:base64]
     has_web = web_data[:valid_urls].any? && web_data[:text].length > 200
 
-    computed_status = if has_registry && has_web && has_image
+    computed_status = if is_deep_search
+                        "Found (Deep Search)"
+                      elsif has_registry && has_web && has_image
                         "Found (Registry+Web+Image)"
                       elsif has_web && has_image
                         "Found (Web+Image)"
@@ -263,22 +264,27 @@ class MasterDataHunter
     urls
   end
 
-  # --- IMAGE DOWNLOADER ---
+  # --- IMAGE DOWNLOADER (v2.7 RESTORED + HARDENED) ---
   def find_best_image(gtin, market)
-    return nil if SERPAPI_KEY.nil?
+    return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = (market == "UK" ? "gb" : market.downcase)
-    bans = "-site:openfoodfacts.org"
 
     begin
-      res = GoogleSearch.new(q: "#{gtin} product #{bans}", tbm: "isch", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash
-      images = (res[:images_results] || []).first(3) 
+      # Stage 1: The Stable Seed (Barcode sites)
+      res = GoogleSearch.new(q: "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
+      
+      # Stage 2: Fallback to generic if empty
+      if (res[:images_results] || []).empty?
+        res = GoogleSearch.new(q: "#{gtin} product -site:openfoodfacts.org", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash
+      end
+
+      images = (res[:images_results] || []).first(5) # Try up to 5 images
       
       images.each do |img|
         url = img[:original]
         next if url.nil? || url.include?("placeholder")
         
         begin
-          # Fix 2: Redundant timeout keys so it never hangs regardless of backend adapter
           tempfile = Down.download(
             url, 
             max_size: (1.5 * 1024 * 1024).to_i,
@@ -468,7 +474,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v3.7 (Hardened)</title>
+  <title>TGTG AI Hunter v3.8 (The Final Fusion)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -489,6 +495,7 @@ __END__
 
     .status-badge { padding: 4px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; text-transform: uppercase; }
     .st-found { background: #d4edda; color: #155724; }
+    .st-deep { background: #cce5ff; color: #004085; }
     .st-reg { background: #fff3cd; color: #856404; }
     .st-miss { background: #f8d7da; color: #721c24; }
     .img-thumb { width: 50px; height: 50px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; padding: 2px; }
@@ -512,7 +519,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.7 (Hardened)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.8 (The Final Fusion)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -606,6 +613,7 @@ __END__
 
         let sClass = 'st-found';
         if (data.status.includes("Registry")) sClass = 'st-reg';
+        if (data.status.includes("Deep")) sClass = 'st-deep';
         if (data.status.includes("Error") || data.status.includes("Missing") || data.status.includes("Server") || data.status.includes("Blind")) sClass = 'st-miss';
 
         const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>` : '-';
@@ -626,7 +634,6 @@ __END__
         }
         sourcesHTML += `</div>`;
         
-        // JS Error Fix: Handle Arrays and Objects dynamically before using string replace
         const fmt = (val) => {
           if (!val) return "-";
           if (Array.isArray(val)) val = val.join(', ');
@@ -659,7 +666,7 @@ __END__
         `;
         resultsData.push(data);
       } catch (e) {
-        console.error(`Frontend crashed on EAN ${gtin}:`, e); // Logs frontend JS errors directly to browser console
+        console.error(`Frontend crashed on EAN ${gtin}:`, e);
         tr.innerHTML = `<td colspan="20" style="color:red; text-align:center;">Network/Server Error for ${gtin}</td>`;
       }
       processed++;
