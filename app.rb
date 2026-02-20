@@ -16,6 +16,10 @@ SERPAPI_KEY        = ENV['SERPAPI_KEY']
 EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN']
 
 BAD_URL_PATTERNS = %w[rezept recipe kuchen torta blog forum pinterest wiki tiktok facebook instagram].freeze
+ALLOWED_KEYS = %w[
+  brand product_name net_weight ingredients allergens may_contain nutri_scope
+  energy fat saturates carbs sugars protein fiber salt organic_id sources_summary
+].freeze
 
 class MasterDataHunter
   include HTTParty
@@ -23,6 +27,7 @@ class MasterDataHunter
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
     
+    # 1. Market Language Logic
     @country_langs = {
       "DE" => "German", "AT" => "German", "CH" => "German",
       "UK" => "English", "GB" => "English", "FR" => "French",
@@ -32,7 +37,26 @@ class MasterDataHunter
       "BE" => "German, French, AND Dutch (Must provide all 3)"
     }
 
-    # Goldmine upgraded with v2.7 DE/AT trusted endpoints
+    # 2. Localized Deep Search Terms (NEW)
+    @local_search_terms = {
+      "FR" => "ingrédients nutrition",
+      "IT" => "ingredienti nutrizionali",
+      "ES" => "ingredientes nutrición",
+      "NL" => "ingrediënten voedingswaarde",
+      "DK" => "ingredienser næringsindhold",
+      "SE" => "ingredienser näringsvärde",
+      "NO" => "ingredienser næringsinnhold",
+      "FI" => "ainesosat ravintosisältö",
+      "PL" => "składniki wartości odżywcze",
+      "DE" => "zutaten nährwerte",
+      "AT" => "zutaten nährwerte",
+      "CH" => "zutaten nährwerte",
+      "BE" => "ingrédients ingrediënten",
+      "UK" => "ingredients nutrition",
+      "PT" => "ingredientes nutrição"
+    }
+
+    # 3. Trusted Retailers
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:openfoodfacts.org",
       "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:ocado.com",
@@ -54,20 +78,20 @@ class MasterDataHunter
     return { found: false, status: "Missing GEMINI_API_KEY" } if GEMINI_API_KEY.nil? || GEMINI_API_KEY.empty?
 
     confirmed_sources = []
+    is_deep_search = false
     
+    # --- STEP 1: OFFICIAL REGISTRY ---
     official_data = fetch_official_ean_data(gtin)
     registry_name = official_data ? official_data['name'] : nil
     if official_data
       confirmed_sources << { type: "registry", title: "Official Registry", url: "https://www.ean-search.org/?q=#{gtin}" }
     end
 
-    # --- PARALLEL SEARCH EXECUTION ---
+    # --- STEP 2: PARALLEL SEARCH EXECUTION ---
     threads = []
     
     retailer_results = []
-    threads << Thread.new do
-      retailer_results = find_retailer_urls(gtin, market)
-    end
+    threads << Thread.new { retailer_results = find_retailer_urls(gtin, market) }
 
     deep_results = []
     threads << Thread.new do
@@ -76,20 +100,20 @@ class MasterDataHunter
     end
 
     image_data = nil
-    threads << Thread.new do
-      image_data = find_best_image(gtin, market)
-    end
+    image_thread = Thread.new { image_data = find_best_image(gtin, market) }
 
-    # Wait safely: We rely on internal network timeouts, not thread killing
+    # Thread Synchronization Guard
     deadline = Time.now + 9
+    image_thread.join([deadline - Time.now, 0].max) if image_thread.alive?
     threads.each do |t|
       remaining = deadline - Time.now
       t.join(remaining > 0 ? remaining : 0.1)
-      log("WARN: Thread alive after deadline for #{gtin}. Letting it finish naturally.") if t.alive?
     end
+    (threads + [image_thread]).each { |t| t.kill if t.alive? }
 
     all_urls = (retailer_results + deep_results).uniq.first(5)
 
+    # --- STEP 3: SCRAPING ---
     web_data = fetch_parallel_page_data(all_urls)
     web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
     
@@ -103,35 +127,48 @@ class MasterDataHunter
 
     final_name_context = official_data ? official_data : { 'name' => registry_name }
 
+    # --- STEP 4: AI ANALYSIS ---
     ai_result = analyze_with_gemini(image_data, web_data[:text], final_name_context, gtin, market)
-    ai_hash = ai_result.is_a?(Hash) ? ai_result.transform_keys(&:to_sym) : {}
-
-    if ai_hash[:error]
-      return empty_result(gtin, market, ai_hash[:error], image_data ? image_data[:url] : nil)
+    
+    ai_hash = {}
+    if ai_result.is_a?(Hash)
+      ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result[k] if ai_result.key?(k) }
+      ai_hash["error"] = ai_result["error"] if ai_result["error"]
     end
 
-    # --- FALLBACK ESCALATION ---
-    ing_text = ai_hash[:ingredients].to_s.downcase
-    missing_phrases = ["keine", "not found", "unavailable", "inconnu", "non trouvé", "nicht verfügbar", "none"]
+    if ai_hash["error"]
+      return empty_result(gtin, market, ai_hash["error"], image_data ? image_data[:url] : nil)
+    end
+
+    # --- STEP 5: LOCALIZED FALLBACK ESCALATION ---
+    ing_text = ai_hash["ingredients"].to_s.downcase
+    missing_phrases = [
+      "keine", "not found", "unavailable", "inconnu", "non trouvé", "nicht verfügbar", "none",
+      "no encontrado", "no disponible", "niet gevonden", "niet beschikbaar", 
+      "ikke fundet", "hittades inte", "ikke funnet", "brak", "niedostępne", 
+      "ei löydy", "non trovato", "non disponibile"
+    ]
     
     if ing_text.length < 10 || missing_phrases.any? { |p| ing_text.include?(p) }
       log("Fallback Escalation triggered for #{gtin}: Missing/poor ingredients.")
       
-      search_name = ai_hash[:product_name] || registry_name || infer_name_from_ean(gtin, market)
+      search_name = ai_hash["product_name"] || registry_name || infer_name_from_ean(gtin, market)
       
       if search_name && search_name.length > 3
-        fallback_urls = find_deep_urls(search_name, market) # Re-fetches with new name
+        fallback_urls = find_deep_urls(search_name, market) 
         
         if fallback_urls.any?
           fallback_web_data = fetch_parallel_page_data(fallback_urls)
           
           if fallback_web_data[:text].length > 200
+            is_deep_search = true
             combined_text = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_web_data[:text]
             fallback_web_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
             
             ai_result2 = analyze_with_gemini(image_data, combined_text, final_name_context, gtin, market)
-            ai_hash2 = ai_result2.is_a?(Hash) ? ai_result2.transform_keys(&:to_sym) : {}
-            ai_hash = ai_hash2 unless ai_hash2[:error]
+            if ai_result2.is_a?(Hash) && !ai_result2["error"]
+              ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result2[k] if ai_result2.key?(k) }
+            end
             
             web_data[:valid_urls] += fallback_web_data[:valid_urls]
             web_data[:text] = combined_text
@@ -147,10 +184,32 @@ class MasterDataHunter
                       image_data ? image_data[:url] : nil
                     end
 
+    has_registry = !!official_data
+    has_image = image_data && image_data[:base64]
+    has_web = web_data[:valid_urls].any? && web_data[:text].length > 200
+
+    computed_status = if is_deep_search
+                        "Found (Deep Search)"
+                      elsif has_registry && has_web && has_image
+                        "Found (Registry+Web+Image)"
+                      elsif has_web && has_image
+                        "Found (Web+Image)"
+                      elsif has_web
+                        "Found (Web)"
+                      elsif has_image && has_registry
+                        "Found (Registry+Image)"
+                      elsif has_image
+                        "Found (Image)"
+                      elsif has_registry
+                        "Registry Only"
+                      else
+                        "Blind"
+                      end
+
     {
       found: true,
       gtin: gtin,
-      status: (web_data[:text].length > 100 ? "Found (Verified)" : "Registry Only"),
+      status: computed_status,
       market: market,
       image_url: display_image, 
       issuing_country: origin_country,
@@ -219,18 +278,17 @@ class MasterDataHunter
     bans = "-site:openfoodfacts.org"
     clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
     goldmine = @goldmine_sites[market]
+    local_terms = @local_search_terms[market] || "ingredients nutrition"
     
     urls = []
     begin
-      # Stage 1: Trusted Domains for Deep Search
       if goldmine
-        res = Timeout.timeout(6) { GoogleSearch.new(q: "#{goldmine} #{clean_name} zutaten nährwerte ingredients nutrition #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(6) { GoogleSearch.new(q: "#{goldmine} \"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
       
-      # Stage 2: Wide search ONLY if trusted domains failed
       if urls.empty?
-        res = Timeout.timeout(6) { GoogleSearch.new(q: "#{clean_name} ingredients nutrition #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(6) { GoogleSearch.new(q: "\"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
     rescue => e
@@ -244,7 +302,6 @@ class MasterDataHunter
     gl = (market == "UK" ? "gb" : market.downcase)
 
     begin
-      # 2-Stage Image Query
       res = Timeout.timeout(6) { GoogleSearch.new(q: "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash }
       if (res[:images_results] || []).empty?
         res = Timeout.timeout(6) { GoogleSearch.new(q: "#{gtin} product -site:openfoodfacts.org", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash }
@@ -258,13 +315,12 @@ class MasterDataHunter
         next if url.nil? || url.include?("placeholder")
         
         begin
+          # PERFECTED DOWN ARGS - No more ArgumentErrors!
           tempfile = Down.download(
             url, 
             max_size: 1.5 * 1024 * 1024,
             open_timeout: 4, 
             read_timeout: 4, 
-            timeout_open: 4,
-            timeout_read: 4,
             headers: { 
               "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
               "Accept" => "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
@@ -315,7 +371,6 @@ class MasterDataHunter
             
             json_ld = ""
             doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
-            
             doc = nil 
             
             if txt.length > 200
@@ -414,7 +469,7 @@ class MasterDataHunter
         next 
       end
     end
-    { error: "AI Failed to Analyze" }
+    { "error" => "AI Failed to Analyze" }
   end
 
   def empty_result(gtin, market, msg, img)
@@ -446,7 +501,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v3.8 (Hardened)</title>
+  <title>TGTG AI Hunter v3.9 (Stable Fusion)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -467,6 +522,7 @@ __END__
 
     .status-badge { padding: 4px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; text-transform: uppercase; }
     .st-found { background: #d4edda; color: #155724; }
+    .st-deep { background: #cce5ff; color: #004085; }
     .st-reg { background: #fff3cd; color: #856404; }
     .st-miss { background: #f8d7da; color: #721c24; }
     .img-thumb { width: 50px; height: 50px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; padding: 2px; }
@@ -490,7 +546,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.8 (Hardened)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v3.9 (Stable Fusion)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -584,6 +640,7 @@ __END__
 
         let sClass = 'st-found';
         if (data.status.includes("Registry")) sClass = 'st-reg';
+        if (data.status.includes("Deep")) sClass = 'st-deep';
         if (data.status.includes("Error") || data.status.includes("Missing") || data.status.includes("Server") || data.status.includes("Blind")) sClass = 'st-miss';
 
         const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>` : '-';
