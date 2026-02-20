@@ -575,7 +575,11 @@ __END__
         }
         sourcesHTML += `</div>`;
         
-        const fmt = (text) => (text || "-").replace(/\n/g, "<br>");
+        const fmt = (val) => {
+  if (!val) return "-";
+  if (Array.isArray(val)) val = val.join(', ');
+  if (typeof val === 'object') val = JSON.stringify(val);
+  return String(val).replace(/\n/g, "<br>");};
 
         tr.innerHTML = `
           <td><span class="status-badge ${sClass}">${data.status}</span></td>
