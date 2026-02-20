@@ -235,10 +235,20 @@ class MasterDataHunter
 
   def mime_from_fastimage(type)
     case type
+    # --- The Golden Trio (Perfect for both Browser & Gemini) ---
     when :jpeg, :jpg then "image/jpeg"
     when :png  then "image/png"
-    when :gif  then "image/gif"
     when :webp then "image/webp"
+    
+    # --- The Apple Formats (Great for Gemini, but browsers might show a broken icon) ---
+    when :heic then "image/heic"
+    when :heif then "image/heif"
+
+    # --- The Modern Web Formats (Great for Browsers, Gemini *usually* processes them or ignores gracefully) ---
+    when :avif then "image/avif"
+    when :bmp  then "image/bmp"
+    when :gif  then "image/gif"
+    
     else nil
     end
   end
