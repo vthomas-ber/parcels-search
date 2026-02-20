@@ -103,7 +103,7 @@ class MasterDataHunter
     image_thread = Thread.new { image_data = find_best_image(gtin, market) }
 
     # Thread Synchronization Guard
-    deadline = Time.now + 9
+    deadline = Time.now + 25
     image_thread.join([deadline - Time.now, 0].max) if image_thread.alive?
     threads.each do |t|
       remaining = deadline - Time.now
@@ -246,7 +246,7 @@ class MasterDataHunter
     return nil if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
     begin
-      res = Timeout.timeout(6) { GoogleSearch.new(q: "#{gtin}", gl: gl, num: 2, api_key: SERPAPI_KEY).get_hash }
+      res = Timeout.timeout(15) { GoogleSearch.new(q: "#{gtin}", gl: gl, num: 2, api_key: SERPAPI_KEY).get_hash }
       first_result = (res[:organic_results] || []).first
       return first_result[:title].split(/ [|-] /).first.strip if first_result
     rescue => e
@@ -264,7 +264,7 @@ class MasterDataHunter
     
     urls = []
     begin
-      res = Timeout.timeout(6) { GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 4, api_key: SERPAPI_KEY).get_hash }
+      res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 4, api_key: SERPAPI_KEY).get_hash }
       (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
     rescue => e
       log("Search API error (retailers): #{e.message}")
@@ -283,12 +283,12 @@ class MasterDataHunter
     urls = []
     begin
       if goldmine
-        res = Timeout.timeout(6) { GoogleSearch.new(q: "#{goldmine} \"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} \"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
       
       if urls.empty?
-        res = Timeout.timeout(6) { GoogleSearch.new(q: "\"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "\"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
     rescue => e
@@ -302,9 +302,9 @@ class MasterDataHunter
     gl = (market == "UK" ? "gb" : market.downcase)
 
     begin
-      res = Timeout.timeout(6) { GoogleSearch.new(q: "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash }
+      res = Timeout.timeout(15) { GoogleSearch.new(q: "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash }
       if (res[:images_results] || []).empty?
-        res = Timeout.timeout(6) { GoogleSearch.new(q: "#{gtin} product -site:openfoodfacts.org", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{gtin} product -site:openfoodfacts.org", tbm: "isch", gl: gl, api_key: SERPAPI_KEY).get_hash }
       end
 
       images = (res[:images_results] || []).first(5)
