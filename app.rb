@@ -27,7 +27,7 @@ class MasterDataHunter
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
     
-    # 1. Market Language Logic
+    # 1. Market Language Logic (For Gemini AI Prompt)
     @country_langs = {
       "DE" => "German", "AT" => "German", "CH" => "German",
       "UK" => "English", "GB" => "English", "FR" => "French",
@@ -37,7 +37,14 @@ class MasterDataHunter
       "BE" => "German, French, AND Dutch (Must provide all 3)"
     }
 
-    # 2. Localized Search Terms
+    # 2. Google HL Codes (2-letter codes for SerpAPI Image Search)
+    @hl_codes = {
+      "DE" => "de", "AT" => "de", "CH" => "de", "UK" => "en", "GB" => "en",
+      "FR" => "fr", "IT" => "it", "ES" => "es", "NL" => "nl", "BE" => "nl",
+      "DK" => "da", "SE" => "sv", "NO" => "no", "PL" => "pl", "PT" => "pt", "FI" => "fi"
+    }
+
+    # 3. Localized Deep Search Terms
     @local_search_terms = {
       "FR" => "ingrédients nutrition", "IT" => "ingredienti nutrizionali", "ES" => "ingredientes nutrición",
       "NL" => "ingrediënten voedingswaarde", "DK" => "ingredienser næringsindhold", "SE" => "ingredienser näringsvärde",
@@ -46,7 +53,7 @@ class MasterDataHunter
       "BE" => "ingrédients ingrediënten", "UK" => "ingredients nutrition", "PT" => "ingredientes nutrição"
     }
 
-    # 3. Country Names for Strict Image Hunting
+    # 4. Country Names for Strict Image Hunting
     @country_names = {
       "DE" => "Deutschland Germany", "AT" => "Österreich Austria", "CH" => "Schweiz Switzerland",
       "UK" => "UK United Kingdom",   "GB" => "UK United Kingdom", "FR" => "France",
@@ -54,12 +61,30 @@ class MasterDataHunter
       "DK" => "Danmark Denmark", "NL" => "Nederland Netherlands", "BE" => "Belgique België Belgium",
       "SE" => "Sverige Sweden", "NO" => "Norge Norway", "PT" => "Portugal", "FI" => "Suomi Finland"
     }
+
+    # 5. Trusted Retailers
+    @goldmine_sites = {
+      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:openfoodfacts.org",
+      "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:ocado.com",
+      "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl",
+      "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be",
+      "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:motatos.de OR site:picnic.app OR site:dm.de OR site:rossmann.de",
+      "AT" => "site:billa.at OR site:spar.at OR site:gurkerl.at OR site:motatos.at OR site:hofer.at OR site:unimarkt.at",
+      "DK" => "site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk OR site:netto.dk",
+      "IT" => "site:carrefour.it OR site:conad.it OR site:coop.it",
+      "ES" => "site:carrefour.es OR site:mercadona.es OR site:dia.es",
+      "SE" => "site:ica.se OR site:coop.se OR site:willys.se OR site:matsmart.se",
+      "NO" => "site:oda.com OR site:meny.no OR site:holdbart.no",
+      "FI" => "site:k-ruoka.fi OR site:s-kaupat.fi OR site:matsmart.fi",
+      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl"
+    }
   end
 
   def process_product(gtin, market)
     return { found: false, status: "Missing GEMINI_API_KEY" } if GEMINI_API_KEY.nil? || GEMINI_API_KEY.empty?
 
     confirmed_sources = []
+    is_deep_search = false
     
     # --- STEP 1: OFFICIAL REGISTRY ---
     official_data = fetch_official_ean_data(gtin)
@@ -83,7 +108,7 @@ class MasterDataHunter
     image_data = nil
     image_thread = Thread.new { image_data = find_best_image(gtin, market, official_data) }
 
-    # Thread Synchronization Guard (Extended to 25s for higher yield)
+    # Thread Synchronization Guard
     deadline = Time.now + 25
     image_thread.join([deadline - Time.now, 0].max) if image_thread.alive?
     threads.each do |t|
@@ -94,7 +119,7 @@ class MasterDataHunter
 
     all_urls = (retailer_results + deep_results).uniq.first(5)
 
-    # --- STEP 3: PARALLEL SCRAPING ---
+    # --- STEP 3: SCRAPING ---
     web_data = fetch_parallel_page_data(all_urls)
     web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
     
@@ -102,7 +127,6 @@ class MasterDataHunter
       confirmed_sources << { type: "image", title: "Source Image", url: image_data[:url] }
     end
 
-    # Fail fast if blind
     if (image_data.nil? || image_data[:base64].nil?) && web_data[:text].strip.empty?
       return empty_result(gtin, market, "No Data Found (Blind)", nil)
     end
@@ -122,6 +146,43 @@ class MasterDataHunter
       return empty_result(gtin, market, ai_hash["error"], image_data ? image_data[:url] : nil)
     end
 
+    # --- STEP 5: LOCALIZED FALLBACK ESCALATION ---
+    ing_text = ai_hash["ingredients"].to_s.downcase
+    missing_phrases = [
+      "keine", "not found", "unavailable", "inconnu", "non trouvé", "nicht verfügbar", "none",
+      "no encontrado", "no disponible", "niet gevonden", "niet beschikbaar", 
+      "ikke fundet", "hittades inte", "ikke funnet", "brak", "niedostępne", 
+      "ei löydy", "non trovato", "non disponibile"
+    ]
+    
+    if ing_text.length < 10 || missing_phrases.any? { |p| ing_text.include?(p) }
+      log("Fallback Escalation triggered for #{gtin}: Missing/poor ingredients.")
+      
+      search_name = ai_hash["product_name"] || registry_name || infer_name_from_ean(gtin, market)
+      
+      if search_name && search_name.length > 3
+        fallback_urls = find_deep_urls(search_name, market) 
+        
+        if fallback_urls.any?
+          fallback_web_data = fetch_parallel_page_data(fallback_urls)
+          
+          if fallback_web_data[:text].length > 200
+            is_deep_search = true
+            combined_text = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_web_data[:text]
+            fallback_web_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
+            
+            ai_result2 = analyze_with_gemini(image_data, combined_text, final_name_context, gtin, market)
+            if ai_result2.is_a?(Hash) && !ai_result2["error"]
+              ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result2[k] if ai_result2.key?(k) }
+            end
+            
+            web_data[:valid_urls] += fallback_web_data[:valid_urls]
+            web_data[:text] = combined_text
+          end
+        end
+      end
+    end
+
     origin_country = official_data ? official_data['issuingCountry'] : nil
     display_image = if image_data && image_data[:base64] && image_data[:mime]
                       "data:#{image_data[:mime]};base64,#{image_data[:base64]}"
@@ -129,10 +190,32 @@ class MasterDataHunter
                       image_data ? image_data[:url] : nil
                     end
 
+    has_registry = !!official_data
+    has_image = image_data && image_data[:base64]
+    has_web = web_data[:valid_urls].any? && web_data[:text].length > 200
+
+    computed_status = if is_deep_search
+                        "Found (Deep Search)"
+                      elsif has_registry && has_web && has_image
+                        "Found (Registry+Web+Image)"
+                      elsif has_web && has_image
+                        "Found (Web+Image)"
+                      elsif has_web
+                        "Found (Web)"
+                      elsif has_image && has_registry
+                        "Found (Registry+Image)"
+                      elsif has_image
+                        "Found (Image)"
+                      elsif has_registry
+                        "Registry Only"
+                      else
+                        "Blind"
+                      end
+
     {
       found: true,
       gtin: gtin,
-      status: (web_data[:text].length > 100 ? "Found (Verified)" : "Registry Only"),
+      status: computed_status,
       market: market,
       image_url: display_image, 
       issuing_country: origin_country,
@@ -181,10 +264,13 @@ class MasterDataHunter
   def find_retailer_urls(gtin, market)
     return [] if SERPAPI_KEY.nil?
     gl = (market == "UK" ? "gb" : market.downcase)
-    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:youtube.com"
+    goldmine = @goldmine_sites[market]
+    bans = "-site:openfoodfacts.org"
+    return [] unless goldmine
+    
     urls = []
     begin
-      res = Timeout.timeout(15) { GoogleSearch.new(q: "#{gtin} product #{bans}", gl: gl, num: 5, api_key: SERPAPI_KEY).get_hash }
+      res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 4, api_key: SERPAPI_KEY).get_hash }
       (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
     rescue => e
       log("Search API error (retailers): #{e.message}")
@@ -195,14 +281,22 @@ class MasterDataHunter
   def find_deep_urls(name, market)
     return [] if name.nil? || name.length < 3
     gl = (market == "UK" ? "gb" : market.downcase)
-    bans = "-site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
+    bans = "-site:openfoodfacts.org"
     clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
+    goldmine = @goldmine_sites[market]
     local_terms = @local_search_terms[market] || "ingredients nutrition"
     
     urls = []
     begin
-      res = Timeout.timeout(15) { GoogleSearch.new(q: "\"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 4, api_key: SERPAPI_KEY).get_hash }
-      (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
+      if goldmine
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} \"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
+        (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
+      end
+      
+      if urls.empty?
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "\"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
+        (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
+      end
     rescue => e
       log("Search API error (deep links): #{e.message}")
     end
@@ -213,24 +307,24 @@ class MasterDataHunter
   def find_best_image(gtin, market, official_data)
     return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = (market == "UK" ? "gb" : market.downcase)
-    hl = @country_langs[market] || "en"
+    
+    # FIX: Use the new 2-letter code dictionary specifically for the hl parameter
+    hl = @hl_codes[market] || "en" 
+    
     country_name = @country_names[market] || ""
 
-    # Attempt 1: Official Registry Image
     if official_data && is_good_image_size?(official_data['image'])
       log("IMG found in Official Registry for #{gtin}")
       encoded = download_and_encode(official_data['image'], "https://www.ean-search.org/?q=#{gtin}")
       return encoded if encoded
     end
 
-    # Define the Search Cascades
     searches = [
-      "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", # Attempt 2: Targeted
-      "\"#{gtin}\" #{country_name}",                         # Attempt 3: Strict
-      "\"#{gtin}\""                                          # Attempt 4: Broad
+      "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"",
+      "\"#{gtin}\" #{country_name}",
+      "\"#{gtin}\""
     ]
     
-    # Attempt 5: Name Search (if available)
     if official_data && official_data['name']
       clean_name = official_data['name'].gsub(/[^a-zA-Z0-9\s]/, '')
       searches << clean_name if clean_name.length > 3
@@ -246,7 +340,6 @@ class MasterDataHunter
           next if url.nil? || url.include?("placeholder")
           next if url.include?("pinterest") || url.include?("ebay") || url.include?("openfoodfacts")
           
-          # Use FastImage to check aspect ratio and size before heavily downloading
           if is_good_image_size?(url)
             encoded = download_and_encode(url, img[:link])
             if encoded
@@ -268,7 +361,6 @@ class MasterDataHunter
       size = Timeout.timeout(4) { FastImage.size(url, timeout: 3, http_header: { 'User-Agent' => 'Mozilla/5.0' }) }
       return false unless size
       w, h = size
-      # Must be wide enough, and aspect ratio (width/height) between 0.3 (tall) and 2.5 (wide)
       w > 300 && (w.to_f / h.to_f).between?(0.3, 2.5)
     rescue
       false
@@ -303,7 +395,6 @@ class MasterDataHunter
     nil
   end
 
-  # --- PARALLEL SCRAPER (The Stability Core) ---
   def fetch_parallel_page_data(urls)
     return { text: "", valid_urls: [] } if urls.empty?
 
@@ -455,7 +546,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v4.0 (The Ultimate Synthesis)</title>
+  <title>TGTG AI Hunter v4.1 (Stable & Multilingual)</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -476,6 +567,7 @@ __END__
 
     .status-badge { padding: 4px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; text-transform: uppercase; }
     .st-found { background: #d4edda; color: #155724; }
+    .st-deep { background: #cce5ff; color: #004085; }
     .st-reg { background: #fff3cd; color: #856404; }
     .st-miss { background: #f8d7da; color: #721c24; }
     .img-thumb { width: 50px; height: 50px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; padding: 2px; }
@@ -499,7 +591,7 @@ __END__
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v4.0 (The Ultimate Synthesis)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v4.1 (Stable & Multilingual)</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -593,6 +685,7 @@ __END__
 
         let sClass = 'st-found';
         if (data.status.includes("Registry")) sClass = 'st-reg';
+        if (data.status.includes("Deep")) sClass = 'st-deep';
         if (data.status.includes("Error") || data.status.includes("Missing") || data.status.includes("Server") || data.status.includes("Blind")) sClass = 'st-miss';
 
         const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>` : '-';
