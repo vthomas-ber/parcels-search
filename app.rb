@@ -301,13 +301,13 @@ class MasterDataHunter
     begin
       # Stage 1: Trusted Local Domains
       if goldmine
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} "#{clean_name}" #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{clean_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
       # Stage 2: Broad Local Search
       if urls.empty?
-        res = Timeout.timeout(15) { GoogleSearch.new(q: ""#{clean_name}" #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{clean_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
       
@@ -317,7 +317,7 @@ class MasterDataHunter
       if urls.empty?
         log("Global Bypass Triggered for: #{clean_name}")
         # Notice we do NOT pass the `gl` or `hl` parameters here!
-        global_res = Timeout.timeout(15) { GoogleSearch.new(q: "\"#{clean_name}\" ingredients nutrition #{bans}", num: 4, api_key: SERPAPI_KEY).get_hash }
+        global_res = Timeout.timeout(15) { GoogleSearch.new(q: "#{clean_name}\" ingredients nutrition #{bans}", num: 4, api_key: SERPAPI_KEY).get_hash }
         (global_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
