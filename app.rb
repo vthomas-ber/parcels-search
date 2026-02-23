@@ -427,6 +427,7 @@ class MasterDataHunter
     nil
   end
 
+  # --- PARALLEL SCRAPER (With Conditional ZenRows Escalation) ---
   def fetch_parallel_page_data(urls)
     return { text: "", valid_urls: [] } if urls.empty?
 
@@ -437,26 +438,32 @@ class MasterDataHunter
     urls.each do |url|
       threads << Thread.new do
         begin
-          response = nil
+          # 1. First Attempt: Standard, free, fast scrape
+          agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+          response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 8)
           
-          # If ZenRows is configured, use it to smash through Cloudflare
-          if ZENROWS_API_KEY && !ZENROWS_API_KEY.empty?
+          # 2. Check if we hit a wall (Bot Protection or Empty JS Shell)
+          is_blocked = [400, 403, 429, 503].include?(response.code)
+          is_js_shell = response.code == 200 && response.body.to_s.length < 1000
+
+          # 3. Escalation: If blocked and ZenRows is available, smash through
+          if (is_blocked || is_js_shell) && ZENROWS_API_KEY && !ZENROWS_API_KEY.empty?
+            log("Wall detected on #{url} (Code: #{response.code}). Escalating to ZenRows...")
+            
             api_url = "https://api.zenrows.com/v1/"
             query_params = {
               apikey: ZENROWS_API_KEY,
               url: url,
-              js_render: 'true', # Renders JavaScript (great for modern stores)
-              antibot: 'true'    # Bypasses Cloudflare / Datadome 
+              js_render: 'true',
+              antibot: 'true',
+              premium_proxy: 'true' # Crucial for beating DataDome on Rewe/Rossmann
             }
-            # ZenRows needs extra time to solve Cloudflare CAPTCHAs, so we give it 25 seconds
+            # ZenRows needs extra time to solve Cloudflare CAPTCHAs
             response = HTTParty.get(api_url, query: query_params, timeout: 25)
-          else
-            # Fallback to standard scraping if ZenRows key is missing
-            agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 10)
           end
           
-          if response.code == 200
+          # 4. Process the response (whether from standard HTTParty or ZenRows)
+          if response && response.code == 200
             doc = Nokogiri::HTML(response.body)
             doc.css('script, style, nav, footer, iframe, header, .cookie').remove
             txt = doc.text.gsub(/\s+/, " ").strip[0..8000]
@@ -464,7 +471,7 @@ class MasterDataHunter
             json_ld = ""
             doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
             
-            doc = nil 
+            doc = nil # Explicitly free memory for Ruby GC
             
             # Keep the site if it has visible text OR rich hidden JSON data
             if txt.length > 150 || json_ld.length > 100
@@ -472,7 +479,7 @@ class MasterDataHunter
               Thread.current[:text] = "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
             end
           else
-             log("Scrape non-200 url=#{url} status=#{response.code}")
+             log("Scrape non-200 url=#{url} status=#{response ? response.code : 'timeout/nil'}")
           end
         rescue => e
           log("Scrape fail url=#{url} err=#{e.class}: #{e.message}")
