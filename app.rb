@@ -117,7 +117,7 @@ class MasterDataHunter
     end
     (threads + [image_thread]).each { |t| t.kill if t.alive? }
 
-    all_urls = (retailer_results + deep_results).uniq.first(5)
+    all_urls = (retailer_results + deep_results).uniq.first(10)
 
     # --- STEP 3: SCRAPING ---
     web_data = fetch_parallel_page_data(all_urls)
@@ -280,7 +280,7 @@ class MasterDataHunter
     
     urls = []
     begin
-      res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 4, api_key: SERPAPI_KEY).get_hash }
+      res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 7, api_key: SERPAPI_KEY).get_hash }
       (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
     rescue => e
       log("Search API error (retailers): #{e.message}")
@@ -299,12 +299,12 @@ class MasterDataHunter
     urls = []
     begin
       if goldmine
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} \"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} \"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
       
       if urls.empty?
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "\"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 3, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "\"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
     rescue => e
@@ -428,7 +428,7 @@ class MasterDataHunter
             
             doc = nil 
             
-            if txt.length > 200
+            if txt.length > 150 || json_ld.length > 100
               Thread.current[:valid] = url
               Thread.current[:text] = "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
             end
