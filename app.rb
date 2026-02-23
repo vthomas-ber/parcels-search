@@ -14,6 +14,7 @@ require 'timeout'
 GEMINI_API_KEY     = ENV['GEMINI_API_KEY']
 SERPAPI_KEY        = ENV['SERPAPI_KEY']
 EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN']
+ZENROWS_API_KEY    = ENV['ZENROWS_API_KEY']
 
 BAD_URL_PATTERNS = %w[rezept recipe kuchen torta blog forum pinterest wiki tiktok facebook instagram].freeze
 ALLOWED_KEYS = %w[
@@ -298,19 +299,32 @@ class MasterDataHunter
     
     urls = []
     begin
+      # Stage 1: Trusted Local Domains
       if goldmine
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} \"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} "#{clean_name}" #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
+        (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
+      end
+
+      # Stage 2: Broad Local Search
+      if urls.empty?
+        res = Timeout.timeout(15) { GoogleSearch.new(q: ""#{clean_name}" #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
       
+      # --- NEW: STAGE 3 (THE GLOBAL BYPASS) ---
+      # If the product is an import and local searches failed, we drop the 'gl' parameter 
+      # and use universal English terms to search the entire global web.
       if urls.empty?
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "\"#{clean_name}\" #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
-        (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
+        log("Global Bypass Triggered for: #{clean_name}")
+        # Notice we do NOT pass the `gl` or `hl` parameters here!
+        global_res = Timeout.timeout(15) { GoogleSearch.new(q: "\"#{clean_name}\" ingredients nutrition #{bans}", num: 4, api_key: SERPAPI_KEY).get_hash }
+        (global_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
+
     rescue => e
       log("Search API error (deep links): #{e.message}")
     end
-    urls.first(3)
+    urls.uniq.first(6)
   end
 
   # --- ULTIMATE 5-TIER IMAGE DOWNLOADER ---
@@ -415,8 +429,24 @@ class MasterDataHunter
     urls.each do |url|
       threads << Thread.new do
         begin
-          agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-          response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 6)
+          response = nil
+          
+          # If ZenRows is configured, use it to smash through Cloudflare
+          if ZENROWS_API_KEY && !ZENROWS_API_KEY.empty?
+            api_url = "https://api.zenrows.com/v1/"
+            query_params = {
+              apikey: ZENROWS_API_KEY,
+              url: url,
+              js_render: 'true', # Renders JavaScript (great for modern stores)
+              antibot: 'true'    # Bypasses Cloudflare / Datadome 
+            }
+            # ZenRows needs extra time to solve Cloudflare CAPTCHAs, so we give it 25 seconds
+            response = HTTParty.get(api_url, query: query_params, timeout: 25)
+          else
+            # Fallback to standard scraping if ZenRows key is missing
+            agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+            response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 10)
+          end
           
           if response.code == 200
             doc = Nokogiri::HTML(response.body)
@@ -428,6 +458,7 @@ class MasterDataHunter
             
             doc = nil 
             
+            # Keep the site if it has visible text OR rich hidden JSON data
             if txt.length > 150 || json_ld.length > 100
               Thread.current[:valid] = url
               Thread.current[:text] = "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
