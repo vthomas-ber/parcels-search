@@ -294,6 +294,7 @@ class MasterDataHunter
     gl = (market == "UK" ? "gb" : market.downcase)
     bans = "-site:openfoodfacts.org"
     clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
+    short_name = clean_name.split[0..3].join(" ")
     goldmine = @goldmine_sites[market]
     local_terms = @local_search_terms[market] || "ingredients nutrition"
     
