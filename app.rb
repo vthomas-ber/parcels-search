@@ -435,9 +435,14 @@ class MasterDataHunter
     results_text = []
     valid_urls = []
     
-    urls.each do |url|
+    urls.each_with_index do |url, index|
       threads << Thread.new do
         begin
+          # --- THE STAGGER FIX ---
+          # Sleep for a fraction of a second multiplied by the thread index
+          # Thread 0 sleeps 0s, Thread 1 sleeps 0.3s, Thread 2 sleeps 0.6s
+          sleep(index * 0.3)
+
           # 1. First Attempt: Standard, free, fast scrape
           agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
           response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 8)
