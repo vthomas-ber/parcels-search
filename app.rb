@@ -79,6 +79,16 @@ class MasterDataHunter
       "FI" => "site:k-ruoka.fi OR site:s-kaupat.fi OR site:matsmart.fi",
       "PL" => "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl"
     }
+    # --- NEW: GLOBAL GOLDMINE SITES ---
+    global_sites = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
+
+    # 1. Append the global sites to every existing market's list
+    @goldmine_sites.each do |market, sites|
+      @goldmine_sites[market] = "#{sites} OR #{global_sites}"
+    end
+    
+    # 2. Set them as the default for any market you haven't defined yet (e.g., if you search "CH" or "US")
+    @goldmine_sites.default = global_sites
   end
 
   def process_product(gtin, market)
