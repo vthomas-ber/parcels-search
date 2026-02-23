@@ -292,33 +292,40 @@ class MasterDataHunter
   def find_deep_urls(name, market)
     return [] if name.nil? || name.length < 3
     gl = (market == "UK" ? "gb" : market.downcase)
-    bans = "-site:openfoodfacts.org"
-    clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '')
-    short_name = clean_name.split[0..3].join(" ")
+    
+    # Keeping the social media bans to keep SEO junk out
+    bans = "-site:openfoodfacts.org -site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
+    
+    # 1. Clean the name
+    clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '').gsub(/\s+/, ' ').strip
+    
+    # 2. Smart Truncation: Grab only the first 4 words
+    short_name = clean_name.split(' ')[0..3].join(" ")
+    
     goldmine = @goldmine_sites[market]
     local_terms = @local_search_terms[market] || "ingredients nutrition"
     
     urls = []
     begin
-      # Stage 1: Trusted Local Domains
+      # Stage 1: Trusted Local Domains (Using short_name!)
       if goldmine
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{clean_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{short_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
-      # Stage 2: Broad Local Search
+      # Stage 2: Broad Local Search (Using short_name!)
       if urls.empty?
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{clean_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
+        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{short_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
       
       # --- NEW: STAGE 3 (THE GLOBAL BYPASS) ---
-      # If the product is an import and local searches failed, we drop the 'gl' parameter 
-      # and use universal English terms to search the entire global web.
       if urls.empty?
-        log("Global Bypass Triggered for: #{clean_name}")
-        # Notice we do NOT pass the `gl` or `hl` parameters here!
-        global_res = Timeout.timeout(15) { GoogleSearch.new(q: "#{clean_name}\" ingredients nutrition #{bans}", num: 4, api_key: SERPAPI_KEY).get_hash }
+        # Logging short_name so you can verify it in Render logs
+        log("Global Bypass Triggered for: #{short_name}") 
+        
+        # Clean query using short_name, NO stray quotes, and num: 6
+        global_res = Timeout.timeout(15) { GoogleSearch.new(q: "#{short_name} ingredients nutrition #{bans}", num: 6, api_key: SERPAPI_KEY).get_hash }
         (global_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
