@@ -79,13 +79,16 @@ class MasterDataHunter
       "FI" => "site:k-ruoka.fi OR site:s-kaupat.fi OR site:matsmart.fi",
       "PL" => "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl"
     }
+    # --- NEW: GLOBAL GOLDMINE SITES ---
+    global_sites = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
 
-    # --- NEW: GLOBAL WHOLESALER GOLDMINE ---
-    # We keep this separate to avoid hitting Google's 32-word query limit
-    @global_wholesalers = "site:billigkaffee.eu OR site:fivestartrading-holland.eu OR site:brake.co.uk OR site:suma.coop OR site:superfood-market.com OR site:bbfoodservice.co.uk OR site:atundo.com OR site:smartorganic.com OR site:candyhero.com"
-
+    # 1. Append the global sites to every existing market's list
+    @goldmine_sites.each do |market, sites|
+      @goldmine_sites[market] = "#{sites} OR #{global_sites}"
+    end
+    
     # 2. Set them as the default for any market you haven't defined yet (e.g., if you search "CH" or "US")
-    @goldmine_sites.default = @global_wholesalers
+    @goldmine_sites.default = global_sites
   end
 
   def process_product(gtin, market)
@@ -288,22 +291,12 @@ class MasterDataHunter
     
     urls = []
     begin
-      # Stage 1: Local Supermarkets
-      if goldmine
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
-        (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
-      end
-
-      # Stage 1.5: Global Wholesalers
-      if urls.empty?
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{@global_wholesalers} #{gtin} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
-        (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
-      end
-      
+      res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 7, api_key: SERPAPI_KEY).get_hash }
+      (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
     rescue => e
       log("Search API error (retailers): #{e.message}")
     end
-    urls.uniq.first(6)
+    urls
   end
 
   def find_deep_urls(name, market)
@@ -330,19 +323,13 @@ class MasterDataHunter
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
-      # Stage 1.5: Global Wholesalers & Specialty Shops
-      if urls.empty?
-        res = Timeout.timeout(15) { GoogleSearch.new(q: "#{@global_wholesalers} #{short_name} ingredients nutrition #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
-        (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
-      end
-
       # Stage 2: Broad Local Search (Using short_name!)
       if urls.empty?
         res = Timeout.timeout(15) { GoogleSearch.new(q: "#{short_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
       
-      # STAGE 3 (THE GLOBAL BYPASS) ---
+      # --- NEW: STAGE 3 (THE GLOBAL BYPASS) ---
       if urls.empty?
         # Logging short_name so you can verify it in Render logs
         log("Global Bypass Triggered for: #{short_name}") 
