@@ -16,7 +16,10 @@ SERPAPI_KEY        = ENV['SERPAPI_KEY']
 EAN_SEARCH_TOKEN   = ENV['EAN_SEARCH_TOKEN']
 ZENROWS_API_KEY    = ENV['ZENROWS_API_KEY']
 
-BAD_URL_PATTERNS = %w[rezept recipe kuchen torta blog forum pinterest wiki tiktok facebook instagram].freeze
+BAD_URL_PATTERNS = %w[
+  rezept recipe kuchen torta blog forum pinterest wiki tiktok facebook instagram
+  .xml .xml.gz .pdf .zip .gz .csv sitemap
+].freeze
 ALLOWED_KEYS = %w[
   brand product_name net_weight ingredients allergens may_contain nutri_scope
   energy fat saturates carbs sugars protein fiber salt organic_id sources_summary
@@ -66,7 +69,7 @@ class MasterDataHunter
     # 5. Trusted Retailers
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:openfoodfacts.org",
-      "UK" => "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:ocado.com",
+      "UK" => "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:mysupermarket.co.uk OR site:tesco.com",
       "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl",
       "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be",
       "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:motatos.de OR site:picnic.app OR site:dm.de OR site:rossmann.de",
@@ -121,7 +124,9 @@ class MasterDataHunter
 
     # Thread Synchronization Guard
     deadline = Time.now + 25
-    image_thread.join([deadline - Time.now, 0].max) if image_thread.alive?
+    IMAGE_TIMEOUT = 18  # seconds, independent of other threads
+    image_deadline = Time.now + IMAGE_TIMEOUT
+    image_thread.join([image_deadline - Time.now, 0.5].max) if image_thread.alive?
     threads.each do |t|
       remaining = deadline - Time.now
       t.join(remaining > 0 ? remaining : 0.1)
@@ -265,9 +270,11 @@ class MasterDataHunter
   end
 
   def is_clean_url?(url)
-    return false if url.nil?
-    !BAD_URL_PATTERNS.any? { |p| url.downcase.include?(p) }
+    return false if url.nil? || url.empty?
+    uri_path = URI.parse(url).path.downcase rescue url.downcase
+    !BAD_URL_PATTERNS.any? { |p| url.downcase.include?(p) || uri_path.end_with?(p) }
   end
+
 
   def infer_name_from_ean(gtin, market)
     return nil if SERPAPI_KEY.nil?
@@ -732,105 +739,123 @@ __END__
     const text = document.getElementById('inputList').value;
     const market = document.getElementById('marketSelect').value;
     const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-
     if (lines.length === 0) { alert("Please paste some EANs first."); return; }
 
     document.getElementById('startBtn').disabled = true;
     const tbody = document.querySelector('#resultsTable tbody');
-    tbody.innerHTML = "";
+    tbody.innerHTML = '';
     resultsData = [];
 
+    const rows = lines.map(gtin => {
+      const tr = document.createElement('tr');
+      let emptyCells = '';
+      for (let i = 0; i < 19; i++) emptyCells += '<td></td>';
+      tr.innerHTML = `<td><span class="status-badge" style="background:#eee;color:#666;">...</span></td>` + emptyCells;
+      tbody.appendChild(tr);
+      resultsData.push(null);
+      return tr;
+    });
+
     let processed = 0;
-    const updateProgress = () => { document.getElementById('progressIndicator').innerText = `Processing: ${processed}/${lines.length}`; };
+    const updateProgress = () => {
+      document.getElementById('progressIndicator').innerText = `Processing: ${processed}/${lines.length}`;
+    };
     updateProgress();
 
-    for (const gtin of lines) {
-      const tr = document.createElement('tr');
-      let emptyCells = ""; for(let i=0; i<19; i++) { emptyCells += "<td></td>"; }
-      tr.innerHTML = `<td><span class="status-badge" style="background:#eee; color:#666;">...</span></td>` + emptyCells;
-      tbody.appendChild(tr);
+    const CONCURRENCY = 3;
+    let index = 0;
 
-      try {
-        const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
-        const data = await response.json();
-
-        let sClass = 'st-found';
-        if (data.status.includes("Registry")) sClass = 'st-reg';
-        if (data.status.includes("Deep")) sClass = 'st-deep';
-        if (data.status.includes("Error") || data.status.includes("Missing") || data.status.includes("Server") || data.status.includes("Blind")) sClass = 'st-miss';
-
-        const imgHTML = data.image_url ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>` : '-';
-
-        let sourcesHTML = `<div class="source-list">`;
-        if (data.sources_summary) sourcesHTML += `<span class="ai-note">${data.sources_summary}</span>`;
-        if (data.defined_sources && data.defined_sources.length > 0) {
-           data.defined_sources.forEach(src => {
-              let icon = "🔗";
-              let cssClass = "src-web";
-              if(src.type === 'registry') { icon = "🏛️"; cssClass = "src-registry"; }
-              if(src.type === 'image')    { icon = "📸"; cssClass = "src-img"; }
-              if(src.type === 'rescue')   { icon = "🆘"; cssClass = "src-rescue"; }
-              sourcesHTML += `<a href="${src.url}" target="_blank" class="src-btn ${cssClass}">${icon} ${src.title}</a>`;
-           });
-        } else {
-           sourcesHTML += `<span style="font-size:11px; color:#999;">No links</span>`;
+    async function worker() {
+      while (index < lines.length) {
+        const i = index++;
+        const gtin = lines[i];
+        const tr = rows[i];
+        try {
+          const response = await fetch(`/api/search?gtin=${gtin}&market=${market}`);
+          const data = await response.json();
+          resultsData[i] = data;
+          renderRow(tr, gtin, data);
+        } catch (e) {
+          console.error(`Error on EAN ${gtin}:`, e);
+          tr.innerHTML = `<td colspan="20" style="color:red;text-align:center;">Error for ${gtin}</td>`;
         }
-        sourcesHTML += `</div>`;
-        
-        const fmt = (val) => {
-          if (!val) return "-";
-          if (Array.isArray(val)) val = val.join(', ');
-          if (typeof val === 'object') val = JSON.stringify(val);
-          return String(val).replace(/\n/g, "<br>");
-        };
-
-        tr.innerHTML = `
-          <td><span class="status-badge ${sClass}">${data.status}</span></td>
-          <td>${imgHTML}</td>
-          <td>${gtin}</td>
-          <td>${data.brand || '-'}</td>
-          <td style="font-weight:bold;">${data.product_name || '-'}</td>
-          <td style="text-align:center;">${data.issuing_country || '-'}</td>
-          <td>${sourcesHTML}</td>
-          <td>${data.net_weight || '-'}</td>
-          <td>${data.organic_id || '-'}</td>
-          <td style="font-size:11px;">${fmt(data.ingredients)}</td>
-          <td style="font-size:11px;">${fmt(data.allergens)}</td>
-          <td style="font-size:11px;">${fmt(data.may_contain)}</td>
-          <td>${data.nutri_scope || '-'}</td>
-          <td>${data.energy || '-'}</td>
-          <td>${data.fat || '-'}</td>
-          <td>${data.saturates || '-'}</td>
-          <td>${data.carbs || '-'}</td>
-          <td>${data.sugars || '-'}</td>
-          <td>${data.fiber || '-'}</td>
-          <td>${data.protein || '-'}</td>
-          <td>${data.salt || '-'}</td>
-        `;
-        resultsData.push(data);
-      } catch (e) {
-        console.error(`Frontend crashed on EAN ${gtin}:`, e);
-        tr.innerHTML = `<td colspan="20" style="color:red; text-align:center;">Network/Server Error for ${gtin}</td>`;
+        processed++;
+        updateProgress();
       }
-      processed++;
-      updateProgress();
     }
-    
+
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
     document.getElementById('startBtn').disabled = false;
-    document.getElementById('downloadBtn').style.display = "block";
-    document.getElementById('progressIndicator').innerText = "✅ Complete";
+    document.getElementById('downloadBtn').style.display = 'block';
+    document.getElementById('progressIndicator').innerText = '✅ Complete';
+  }
+
+  function renderRow(tr, gtin, data) {
+    let sClass = 'st-found';
+    if (data.status.includes('Registry')) sClass = 'st-reg';
+    if (data.status.includes('Deep')) sClass = 'st-deep';
+    if (data.status.includes('Error') || data.status.includes('Missing') ||
+        data.status.includes('Server') || data.status.includes('Blind')) sClass = 'st-miss';
+
+    const imgHTML = data.image_url
+      ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>`
+      : '-';
+
+    let sourcesHTML = `<div class="source-list">`;
+    if (data.sources_summary) sourcesHTML += `<span class="ai-note">${data.sources_summary}</span>`;
+    if (data.defined_sources && data.defined_sources.length > 0) {
+      data.defined_sources.forEach(src => {
+        let icon = '🔗', cssClass = 'src-web';
+        if (src.type === 'registry') { icon = '🏛️'; cssClass = 'src-registry'; }
+        if (src.type === 'image')    { icon = '📸'; cssClass = 'src-img'; }
+        if (src.type === 'rescue')   { icon = '🆘'; cssClass = 'src-rescue'; }
+        sourcesHTML += `<a href="${src.url}" target="_blank" class="src-btn ${cssClass}">${icon} ${src.title}</a>`;
+      });
+    } else {
+      sourcesHTML += `<span style="font-size:11px;color:#999;">No links</span>`;
+    }
+    sourcesHTML += `</div>`;
+
+    const fmt = (val) => {
+      if (!val) return '-';
+      if (Array.isArray(val)) val = val.join(', ');
+      if (typeof val === 'object') val = JSON.stringify(val);
+      return String(val).replace(/\n/g, '<br>');
+    };
+
+    tr.innerHTML = `
+      <td><span class="status-badge ${sClass}">${data.status}</span></td>
+      <td>${imgHTML}</td>
+      <td>${gtin}</td>
+      <td>${data.brand || '-'}</td>
+      <td style="font-weight:bold;">${data.product_name || '-'}</td>
+      <td style="text-align:center;">${data.issuing_country || '-'}</td>
+      <td>${sourcesHTML}</td>
+      <td>${data.net_weight || '-'}</td>
+      <td>${data.organic_id || '-'}</td>
+      <td style="font-size:11px;">${fmt(data.ingredients)}</td>
+      <td style="font-size:11px;">${fmt(data.allergens)}</td>
+      <td style="font-size:11px;">${fmt(data.may_contain)}</td>
+      <td>${data.nutri_scope || '-'}</td>
+      <td>${data.energy || '-'}</td>
+      <td>${data.fat || '-'}</td>
+      <td>${data.saturates || '-'}</td>
+      <td>${data.carbs || '-'}</td>
+      <td>${data.sugars || '-'}</td>
+      <td>${data.fiber || '-'}</td>
+      <td>${data.protein || '-'}</td>
+      <td>${data.salt || '-'}</td>`;
   }
 
   function downloadCSV() {
     let csv = "Status,EAN,Brand,ProductName,Origin,Sources,NetWeight,OrganicID,Ingredients,Allergens,MayContain,NutriScope,Energy,Fat,Saturates,Carbs,Sugars,Fiber,Protein,Salt\n";
-    resultsData.forEach(row => {
+    resultsData.filter(Boolean).forEach(row => {
       const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " | ").trim();
-      
       let srcList = "";
-      if(row.defined_sources) {
-         srcList = row.defined_sources.map(s => `[${s.type.toUpperCase()}: ${s.url}]`).join(" | ");
+      if (row.defined_sources) {
+        srcList = row.defined_sources.map(s => `[${s.type.toUpperCase()}: ${s.url}]`).join(" | ");
       }
-
       csv += `${row.status},${row.gtin},${clean(row.brand)},${clean(row.product_name)},${clean(row.issuing_country)},` +
              `${srcList},${clean(row.net_weight)},${clean(row.organic_id)},` +
              `${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},` +
@@ -838,7 +863,6 @@ __END__
              `${clean(row.saturates)},${clean(row.carbs)},${clean(row.sugars)},` +
              `${clean(row.fiber)},${clean(row.protein)},${clean(row.salt)}\n`;
     });
-    
     const link = document.createElement("a");
     link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
     link.download = "tgtg_hunter_results.csv";
