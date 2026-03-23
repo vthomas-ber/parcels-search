@@ -115,8 +115,12 @@ class MasterDataHunter
 
     deep_results = []
     threads << Thread.new do
-      search_name = registry_name || infer_name_from_ean(gtin, market)
-      deep_results = find_deep_urls(search_name, market) if search_name
+    search_name = registry_name || infer_name_from_ean(gtin, market)
+    if search_name
+      deep_results = find_deep_urls(search_name, market)
+    else
+      # Last resort: search the bare GTIN on trusted sites
+      deep_results = find_retailer_urls(gtin, market)
     end
 
     image_data = nil
@@ -337,12 +341,17 @@ class MasterDataHunter
       
       # --- NEW: STAGE 3 (THE GLOBAL BYPASS) ---
       if urls.empty?
-        # Logging short_name so you can verify it in Render logs
-        log("Global Bypass Triggered for: #{short_name}") 
-        
-        # Clean query using short_name, NO stray quotes, and num: 6
+        log("Global Bypass Triggered for: #{short_name}")
         global_res = Timeout.timeout(15) { GoogleSearch.new(q: "#{short_name} ingredients nutrition #{bans}", num: 6, api_key: SERPAPI_KEY).get_hash }
         (global_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
+      end
+
+      # Stage 4: Non-food fallback for pet/household/non-food GTINs
+      if urls.empty?
+        log("Non-food Bypass Triggered for: #{short_name}")
+        non_food_sites = "site:zooplus.com OR site:zooplus.de OR site:pets-premium.de OR site:idealo.de OR site:bol.com"
+        non_food_res = Timeout.timeout(15) { GoogleSearch.new(q: "#{non_food_sites} #{short_name}", num: 6, api_key: SERPAPI_KEY).get_hash }
+        (non_food_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
     rescue => e
@@ -473,11 +482,13 @@ class MasterDataHunter
             
             api_url = "https://api.zenrows.com/v1/"
             query_params = {
-              apikey: ZENROWS_API_KEY,
+             apikey: ZENROWS_API_KEY,
               url: url,
               js_render: 'true',
-              antibot: 'true',
-              premium_proxy: 'true' # Crucial for beating DataDome on Rewe/Rossmann
+             antibot: 'true',
+              premium_proxy: 'true',
+              wait: '3000',           # wait 3s for JS components to expand
+              css_extractor: '{"ingredients":".pdp-description-reviews__product-details-col-2","nutrition":".nutritionTable,.pdp-nutrition-table"}'.to_json
             }
             # ZenRows needs extra time to solve Cloudflare CAPTCHAs
             response = HTTParty.get(api_url, query: query_params, timeout: 25)
