@@ -19,10 +19,13 @@ ZENROWS_API_KEY    = ENV['ZENROWS_API_KEY']
 BAD_URL_PATTERNS = %w[
   rezept recipe kuchen torta blog forum pinterest wiki tiktok facebook instagram
   .xml .xml.gz .pdf .zip .gz .csv sitemap
+  scribd academia researchgate tamu.edu github trinket joybuy momogo
 ].freeze
+
 ALLOWED_KEYS = %w[
   brand product_name net_weight ingredients allergens may_contain nutri_scope
   energy fat saturates carbs sugars protein fiber salt organic_id sources_summary
+  dietary_info format occasion
 ].freeze
 
 class MasterDataHunter
@@ -30,7 +33,7 @@ class MasterDataHunter
 
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
-    
+
     # 1. Market Language Logic (For Gemini AI Prompt)
     @country_langs = {
       "DE" => "German", "AT" => "German", "CH" => "German",
@@ -68,8 +71,8 @@ class MasterDataHunter
 
     # 5. Trusted Retailers
     @goldmine_sites = {
-      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:openfoodfacts.org",
-      "UK" => "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:mysupermarket.co.uk OR site:tesco.com OR site:nutritionix.com OR site:barcodelookup.com OR site:buycott.com",
+      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com",
+      "UK" => "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:mysupermarket.co.uk OR site:tesco.com",
       "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl",
       "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be",
       "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:motatos.de OR site:picnic.app OR site:dm.de OR site:rossmann.de",
@@ -82,15 +85,12 @@ class MasterDataHunter
       "FI" => "site:k-ruoka.fi OR site:s-kaupat.fi OR site:matsmart.fi",
       "PL" => "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl"
     }
-    # --- NEW: GLOBAL GOLDMINE SITES ---
-    global_sites = "site:billigkaffee.eu OR site:fivestartrading-holland.eu OR site:barcodelookup.com OR site:buycott.com"
 
-    # 1. Append the global sites to every existing market's list
+    # Global goldmine sites appended to every market
+    global_sites = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
     @goldmine_sites.each do |market, sites|
       @goldmine_sites[market] = "#{sites} OR #{global_sites}"
     end
-    
-    # 2. Set them as the default for any market you haven't defined yet (e.g., if you search "CH" or "US")
     @goldmine_sites.default = global_sites
   end
 
@@ -99,7 +99,7 @@ class MasterDataHunter
 
     confirmed_sources = []
     is_deep_search = false
-    
+
     # --- STEP 1: OFFICIAL REGISTRY ---
     official_data = fetch_official_ean_data(gtin)
     registry_name = official_data ? official_data['name'] : nil
@@ -109,24 +109,25 @@ class MasterDataHunter
 
     # --- STEP 2: PARALLEL SEARCH EXECUTION ---
     threads = []
-    
+
     retailer_results = []
     threads << Thread.new { retailer_results = find_retailer_urls(gtin, market) }
 
     deep_results = []
     threads << Thread.new do
-    search_name = registry_name || infer_name_from_ean(gtin, market)
-    if search_name
-      deep_results = find_deep_urls(search_name, market)
-    else
-      # Last resort: search the bare GTIN on trusted sites
-      deep_results = find_retailer_urls(gtin, market)
+      search_name = registry_name || infer_name_from_ean(gtin, market)
+      if search_name
+        deep_results = find_deep_urls(search_name, market)
+      else
+        # Last resort: search the bare GTIN on trusted sites
+        deep_results = find_retailer_urls(gtin, market)
+      end
     end
-  end
+
     image_data = nil
     image_thread = Thread.new { image_data = find_best_image(gtin, market, official_data) }
 
-    # Thread Synchronization Guard
+    # Thread Synchronization Guard — image has its own deadline
     deadline = Time.now + 25
     image_deadline = Time.now + 18
     image_thread.join([image_deadline - Time.now, 0.5].max) if image_thread.alive?
@@ -141,7 +142,7 @@ class MasterDataHunter
     # --- STEP 3: SCRAPING ---
     web_data = fetch_parallel_page_data(all_urls)
     web_data[:valid_urls].each { |u| confirmed_sources << { type: "web", title: host_from_url(u), url: u } }
-    
+
     if image_data
       confirmed_sources << { type: "image", title: "Source Image", url: image_data[:url] }
     end
@@ -152,9 +153,20 @@ class MasterDataHunter
 
     final_name_context = official_data ? official_data : { 'name' => registry_name }
 
+    # --- IMAGE DOMAIN CONFIDENCE CHECK ---
+    image_confidence_note = nil
+    if image_data && web_data[:valid_urls].any?
+      image_host = URI.parse(image_data[:url]).host.sub(/^www\./, '') rescue nil
+      web_hosts = web_data[:valid_urls].map { |u| URI.parse(u).host.sub(/^www\./, '') rescue nil }.compact
+      unless web_hosts.any? { |h| h.include?(image_host.to_s.split('.').first) }
+        log("IMG domain mismatch for #{gtin}: image from #{image_host}, web from #{web_hosts.first}")
+        image_confidence_note = "NOTE: Image source domain does not match web sources. Prefer text data over image data if they conflict."
+      end
+    end
+
     # --- STEP 4: AI ANALYSIS ---
-    ai_result = analyze_with_gemini(image_data, web_data[:text], final_name_context, gtin, market)
-    
+    ai_result = analyze_with_gemini(image_data, web_data[:text], final_name_context, gtin, market, image_confidence_note)
+
     ai_hash = {}
     if ai_result.is_a?(Hash)
       ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result[k] if ai_result.key?(k) }
@@ -169,44 +181,48 @@ class MasterDataHunter
     ing_text = ai_hash["ingredients"].to_s.downcase
     missing_phrases = [
       "keine", "not found", "unavailable", "inconnu", "non trouvé", "nicht verfügbar", "none",
-      "no encontrado", "no disponible", "niet gevonden", "niet beschikbaar", 
-      "ikke fundet", "hittades inte", "ikke funnet", "brak", "niedostępne", 
+      "no encontrado", "no disponible", "niet gevonden", "niet beschikbaar",
+      "ikke fundet", "hittades inte", "ikke funnet", "brak", "niedostępne",
       "ei löydy", "non trovato", "non disponibile"
     ]
-    
+
     nutrition_fields = %w[energy fat saturates carbs sugars protein salt]
-    nutrition_missing = nutrition_fields.count { |f|
-      val = ai_hash[f].to_s.downcase
-      val.empty? || val == "-" || val == "null" || val.include?("not") || val.include?("n/a")
-    }
+    is_empty_val = ->(v) { v.to_s.strip.empty? || v.to_s.strip == "-" || v.to_s.downcase.include?("not") || v.to_s.downcase.include?("n/a") || v.to_s.downcase == "null" }
+    nutrition_missing = nutrition_fields.count { |f| is_empty_val.call(ai_hash[f]) }
 
     if ing_text.length < 10 || missing_phrases.any? { |p| ing_text.include?(p) } || nutrition_missing >= 5
-    log("Fallback Escalation triggered for #{gtin}: Missing/poor ingredients.")
-  
-    search_name = ai_hash["product_name"] || registry_name || infer_name_from_ean(gtin, market)
-  
-    if search_name && search_name.length > 3
-    fallback_urls = find_deep_urls(search_name, market) 
-    
-    if fallback_urls.any?
-      fallback_web_data = fetch_parallel_page_data(fallback_urls)
-      
-      if fallback_web_data[:text].length > 200
-        is_deep_search = true
-        combined_text = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_web_data[:text]
-        fallback_web_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
-        
-        ai_result2 = analyze_with_gemini(image_data, combined_text, final_name_context, gtin, market)
-        if ai_result2.is_a?(Hash) && !ai_result2["error"]
-          ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result2[k] if ai_result2.key?(k) }
+      log("Fallback Escalation triggered for #{gtin}: Missing/poor ingredients or nutrition (#{nutrition_missing}/7 nutrition fields empty).")
+
+      search_name = ai_hash["product_name"] || registry_name || infer_name_from_ean(gtin, market)
+
+      if search_name && search_name.length > 3
+        fallback_urls = find_deep_urls(search_name, market)
+
+        if fallback_urls.any?
+          fallback_web_data = fetch_parallel_page_data(fallback_urls)
+
+          if fallback_web_data[:text].length > 200
+            is_deep_search = true
+            combined_text = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_web_data[:text]
+            fallback_web_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
+
+            ai_result2 = analyze_with_gemini(image_data, combined_text, final_name_context, gtin, market, image_confidence_note)
+            if ai_result2.is_a?(Hash) && !ai_result2["error"]
+              ALLOWED_KEYS.each do |k|
+                next unless ai_result2.key?(k)
+                new_val = ai_result2[k].to_s.strip
+                old_val = ai_hash[k].to_s.strip
+                # Only update if new value is meaningfully better than what we have
+                ai_hash[k] = ai_result2[k] if is_empty_val.call(old_val) || (!is_empty_val.call(new_val) && new_val.length > old_val.length)
+              end
+            end
+
+            web_data[:valid_urls] += fallback_web_data[:valid_urls]
+            web_data[:text] = combined_text
+          end
         end
-        
-        web_data[:valid_urls] += fallback_web_data[:valid_urls]
-        web_data[:text] = combined_text
       end
     end
-  end
-end
 
     origin_country = official_data ? official_data['issuingCountry'] : nil
     display_image = if image_data && image_data[:base64] && image_data[:mime]
@@ -242,7 +258,7 @@ end
       gtin: gtin,
       status: computed_status,
       market: market,
-      image_url: display_image, 
+      image_url: display_image,
       issuing_country: origin_country,
       defined_sources: confirmed_sources.uniq { |s| s[:url] }
     }.merge(ai_hash)
@@ -260,20 +276,14 @@ end
 
   def mime_from_fastimage(type)
     case type
-    # --- The Golden Trio (Perfect for both Browser & Gemini) ---
     when :jpeg, :jpg then "image/jpeg"
-    when :png  then "image/png"
-    when :webp then "image/webp"
-    
-    # --- The Apple Formats (Great for Gemini, but browsers might show a broken icon) ---
-    when :heic then "image/heic"
-    when :heif then "image/heif"
-
-    # --- The Modern Web Formats (Great for Browsers, Gemini *usually* processes them or ignores gracefully) ---
-    when :avif then "image/avif"
-    when :bmp  then "image/bmp"
-    when :gif  then "image/gif"
-    
+    when :png        then "image/png"
+    when :webp       then "image/webp"
+    when :heic       then "image/heic"
+    when :heif       then "image/heif"
+    when :avif       then "image/avif"
+    when :bmp        then "image/bmp"
+    when :gif        then "image/gif"
     else nil
     end
   end
@@ -283,7 +293,6 @@ end
     uri_path = URI.parse(url).path.downcase rescue url.downcase
     !BAD_URL_PATTERNS.any? { |p| url.downcase.include?(p) || uri_path.end_with?(p) }
   end
-
 
   def infer_name_from_ean(gtin, market)
     return nil if SERPAPI_KEY.nil?
@@ -304,7 +313,7 @@ end
     goldmine = @goldmine_sites[market]
     bans = "-site:openfoodfacts.org"
     return [] unless goldmine
-    
+
     urls = []
     begin
       res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{gtin} #{bans}", gl: gl, num: 7, api_key: SERPAPI_KEY).get_hash }
@@ -318,46 +327,42 @@ end
   def find_deep_urls(name, market)
     return [] if name.nil? || name.length < 3
     gl = (market == "UK" ? "gb" : market.downcase)
-    
-    # Keeping the social media bans to keep SEO junk out
+
     bans = "-site:openfoodfacts.org -site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
-    
-    # 1. Clean the name
+
     clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '').gsub(/\s+/, ' ').strip
-    
-    # 2. Smart Truncation: Grab only the first 4 words
     short_name = clean_name.split(' ')[0..3].join(" ")
-    
+
     goldmine = @goldmine_sites[market]
     local_terms = @local_search_terms[market] || "ingredients nutrition"
-    
+
     urls = []
     begin
-      # --- NEW STAGE 0: Brand website direct search ---
-      # This finds the manufacturer's own product page which always has complete data
-      brand_res = Timeout.timeout(15) { 
+      # --- STAGE 0: Brand website direct search ---
+      # Finds the manufacturer's own product page which always has the most complete data
+      brand_res = Timeout.timeout(15) {
         GoogleSearch.new(
-          q: "\"#{short_name}\" ingredients nutrition facts #{bans}", 
-          gl: gl, 
-          num: 4, 
+          q: "\"#{short_name}\" ingredients nutrition facts #{bans}",
+          gl: gl,
+          num: 4,
           api_key: SERPAPI_KEY
-        ).get_hash 
+        ).get_hash
       }
       (brand_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
 
-      # Stage 1: Trusted Local Domains (Using short_name!)
+      # Stage 1: Trusted Local Domains
       if goldmine
         res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{short_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
-      # Stage 2: Broad Local Search (Using short_name!)
+      # Stage 2: Broad Local Search
       if urls.empty?
         res = Timeout.timeout(15) { GoogleSearch.new(q: "#{short_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
-      
-      # --- NEW: STAGE 3 (THE GLOBAL BYPASS) ---
+
+      # Stage 3: Global Bypass
       if urls.empty?
         log("Global Bypass Triggered for: #{short_name}")
         global_res = Timeout.timeout(15) { GoogleSearch.new(q: "#{short_name} ingredients nutrition #{bans}", num: 6, api_key: SERPAPI_KEY).get_hash }
@@ -382,10 +387,7 @@ end
   def find_best_image(gtin, market, official_data)
     return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = (market == "UK" ? "gb" : market.downcase)
-    
-    # FIX: Use the new 2-letter code dictionary specifically for the hl parameter
-    hl = @hl_codes[market] || "en" 
-    
+    hl = @hl_codes[market] || "en"
     country_name = @country_names[market] || ""
 
     if official_data && is_good_image_size?(official_data['image'])
@@ -399,7 +401,7 @@ end
       "\"#{gtin}\" #{country_name}",
       "\"#{gtin}\""
     ]
-    
+
     if official_data && official_data['name']
       clean_name = official_data['name'].gsub(/[^a-zA-Z0-9\s]/, '')
       searches << clean_name if clean_name.length > 3
@@ -409,12 +411,12 @@ end
       begin
         res = Timeout.timeout(10) { GoogleSearch.new(q: query, tbm: "isch", gl: gl, hl: hl, api_key: SERPAPI_KEY).get_hash }
         images = (res[:images_results] || []).first(10)
-        
+
         images.each do |img|
           url = img[:original]
           next if url.nil? || url.include?("placeholder")
           next if url.include?("pinterest") || url.include?("ebay") || url.include?("openfoodfacts")
-          
+
           if is_good_image_size?(url)
             encoded = download_and_encode(url, img[:link])
             if encoded
@@ -444,20 +446,20 @@ end
 
   def download_and_encode(url, source_link)
     tempfile = Down.download(
-      url, 
+      url,
       max_size: 1.5 * 1024 * 1024,
-      open_timeout: 4, 
-      read_timeout: 4, 
-      headers: { 
+      open_timeout: 4,
+      read_timeout: 4,
+      headers: {
         "User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept" => "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer" => (source_link || "https://www.google.com/")
+        "Accept"     => "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer"    => (source_link || "https://www.google.com/")
       }
     )
-    
+
     type = FastImage.type(tempfile.path)
     mime = mime_from_fastimage(type)
-    
+
     unless mime
       log("IMG skip url=#{url} reason=Not an image block (type: #{type.inspect})")
       return nil
@@ -477,81 +479,72 @@ end
     threads = []
     results_text = []
     valid_urls = []
-    
+
     urls.each_with_index do |url, index|
       threads << Thread.new do
         begin
-          # --- THE STAGGER FIX ---
-          # Sleep for a fraction of a second multiplied by the thread index
-          # Thread 0 sleeps 0s, Thread 1 sleeps 0.3s, Thread 2 sleeps 0.6s
           sleep(index * 0.3)
 
-          # 1. First Attempt: Standard, free, fast scrape
           agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
           response = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 8)
-          
-          # 2. Check if we hit a wall (Bot Protection or Empty JS Shell)
-          is_blocked = [400, 403, 429, 503].include?(response.code)
+
           body = response.body.to_s
+          is_blocked = [400, 403, 429, 503].include?(response.code)
+          # Enhanced JS shell detection — catches Shopify and similar JS-heavy stores
           is_js_shell = response.code == 200 && (
             body.length < 1000 ||
-           (body.length < 15000 && body.scan(/<script/).length > 10) ||  # JS-heavy with little HTML
-            body.include?("window.ShopifyAnalytics") ||  # Shopify specifically
-            body.include?('"@type":"Product"') == false && body.include?("application/json") && body.length < 5000
+            (body.length < 15000 && body.scan(/<script/).length > 10) ||
+            body.include?("window.ShopifyAnalytics")
           )
 
-          # 3. Escalation: If blocked and ZenRows is available, smash through
           if (is_blocked || is_js_shell) && ZENROWS_API_KEY && !ZENROWS_API_KEY.empty?
             log("Wall detected on #{url} (Code: #{response.code}). Escalating to ZenRows...")
-            
+
             api_url = "https://api.zenrows.com/v1/"
             query_params = {
-             apikey: ZENROWS_API_KEY,
-              url: url,
-              js_render: 'true',
-             antibot: 'true',
+              apikey:        ZENROWS_API_KEY,
+              url:           url,
+              js_render:     'true',
+              antibot:       'true',
               premium_proxy: 'true',
-              wait: '3000',           # wait 3s for JS components to expand
-              css_extractor: '{"ingredients":".pdp-description-reviews__product-details-col-2","nutrition":".nutritionTable,.pdp-nutrition-table"}'.to_json
+              wait:          '3000',
+              css_extractor: '{"ingredients":".pdp-description-reviews__product-details-col-2","nutrition":".nutritionTable,.pdp-nutrition-table"}'
             }
-            # ZenRows needs extra time to solve Cloudflare CAPTCHAs
             response = HTTParty.get(api_url, query: query_params, timeout: 25)
           end
-          
-          # 4. Process the response (whether from standard HTTParty or ZenRows)
+
           if response && response.code == 200
             doc = Nokogiri::HTML(response.body)
             doc.css('script, style, nav, footer, iframe, header, .cookie').remove
             txt = doc.text.gsub(/\s+/, " ").strip[0..8000]
-            
+
             json_ld = ""
             doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
-            
-            doc = nil # Explicitly free memory for Ruby GC
-            
-            # Keep the site if it has visible text OR rich hidden JSON data
+
+            doc = nil
+
             if txt.length > 150 || json_ld.length > 100
               Thread.current[:valid] = url
               Thread.current[:text] = "=== SOURCE: #{url} ===\nCONTENT: #{txt}\nJSON-LD: #{json_ld}\n\n"
             end
           else
-             log("Scrape non-200 url=#{url} status=#{response ? response.code : 'timeout/nil'}")
+            log("Scrape non-200 url=#{url} status=#{response ? response.code : 'timeout/nil'}")
           end
         rescue => e
           log("Scrape fail url=#{url} err=#{e.class}: #{e.message}")
-        end 
+        end
       end
     end
 
     threads.each(&:join)
 
-    threads.each do |t| 
+    threads.each do |t|
       if t[:valid]
         valid_urls << t[:valid]
         results_text << t[:text]
       end
     end
-    
+
     { text: results_text.join("\n"), valid_urls: valid_urls }
   end
 
@@ -567,15 +560,17 @@ end
     nil
   end
 
-  def analyze_with_gemini(image_data, text_data, official, gtin, market)
+  def analyze_with_gemini(image_data, text_data, official, gtin, market, image_confidence_note = nil)
     target_lang = @country_langs[market] || "English"
     name_info = official ? official['name'] : (official.is_a?(Hash) ? official['name'] : "Unknown")
     official_txt = "PRODUCT IDENTITY: #{name_info}"
 
+    confidence_note = image_confidence_note ? "\n#{image_confidence_note}\n" : ""
+
     prompt = <<~TEXT
       You are a Food Data Expert.
       #{official_txt}
-      
+      #{confidence_note}
       INPUT DATA:
       #{text_data}
       #{image_data && image_data[:base64] ? "IMAGE: Provided" : "IMAGE: Not Available"}
@@ -583,36 +578,59 @@ end
       MARKET REQUIREMENTS:
       - Target Market: #{market}
       - Target Languages: #{target_lang}
-      
+
       TASK:
       1. Synthesize all data.
       2. **Translation:** Translate Name, Ingredients, and Allergens to **#{target_lang}**.
       3. **BE Specific:** If Market is 'BE', output Ingredients/Allergens in German, French, AND Dutch.
       4. **Nutrition:** Extract ONLY numeric 100g/ml values.
-       - Only return actual numbers with units e.g. "3.2g", "450kJ / 107kcal".
-       - If you find marketing text like "low in fat", "high in protein" — ignore it, set field to null.
-       - If the page content looks like a JavaScript shell or contains no product data, set ALL nutrition fields to null.
-        - Never return "Not available", "N/A", "Not specified" or descriptive phrases in numeric fields.
-      5. **Confidence:** If the scraped text is clearly not a product page (JS shell, error page, unrelated content), 
-      set sources_summary to "WARNING: Source data quality poor - JS shell or unrelated content detected"
-      OUTPUT JSON (Strict Schema):
+         - Only return actual numbers with units e.g. "3.2g", "450kJ / 107kcal".
+         - If you find marketing text like "low in fat", "high in protein" — ignore it, set field to null.
+         - If page content looks like a JS shell with no product data, set ALL nutrition fields to null.
+         - Never return "Not available", "N/A", "Not specified" or descriptive phrases in numeric fields.
+      5. **Dietary Info:** Select ALL applicable tags from ONLY this exact list (return as comma-separated string):
+         Vegetarian, Vegan, Organic, Halal, Kosher, Dairy Free, Nut Free, Low Sugar, High Protein, Gluten Free, Low Fat
+         - Deduce from ingredients, certifications, and any text or image evidence.
+         - Only include a tag if you are confident it applies. Return null if none apply or cannot be determined.
+      6. **Format:** Select ONE tag from ONLY this exact list:
+         Multipack, Sharing Size, Single
+         - Multipack: multiple units sold together e.g. "6 pack", "2x", "box of 12".
+         - Sharing Size: single large unit clearly intended for sharing e.g. 200g+ bags, family size.
+         - Single: individual portion or on-the-go size.
+         - Deduce from net weight, product name, and packaging description.
+      7. **Occasion:** Select ALL applicable tags from ONLY this exact list (return as comma-separated string):
+         Breakfast, Lunchbox, BBQ, Party, Christmas, Ramadan, Meal Prep, Quick Dinner, Kids Snack
+         - Deduce from product type, ingredients, name, and any marketing text.
+         - Only include tags you are confident about. Return null if none clearly apply.
+
+      OUTPUT JSON (Strict Schema — no extra keys, no markdown):
       {
         "brand": "Brand Name",
-        "product_name": "Name (Translated)", 
+        "product_name": "Name (Translated)",
         "net_weight": "Value",
-        "ingredients": "List (Translated)", 
+        "ingredients": "List (Translated)",
         "allergens": "List (Translated)",
         "may_contain": "List (Translated)",
-        "nutri_scope": "100g", "energy": "kJ/kcal", "fat": "val", "saturates": "val",
-        "carbs": "val", "sugars": "val", "protein": "val", "fiber": "val", "salt": "val",
-        "organic_id": "Code", 
+        "nutri_scope": "100g",
+        "energy": "kJ/kcal",
+        "fat": "val",
+        "saturates": "val",
+        "carbs": "val",
+        "sugars": "val",
+        "protein": "val",
+        "fiber": "val",
+        "salt": "val",
+        "organic_id": "Code",
+        "dietary_info": "Vegetarian, Gluten Free",
+        "format": "Single",
+        "occasion": "Lunchbox, Kids Snack",
         "sources_summary": "Source description"
       }
     TEXT
 
     models = ["models/gemini-2.0-flash", "models/gemini-2.0-flash-lite", "models/gemini-1.5-flash"]
     parts = [{ text: prompt }]
-    
+
     if image_data && image_data[:base64] && image_data[:mime]
       parts << { inline_data: { mime_type: image_data[:mime], data: image_data[:base64] } }
     end
@@ -628,7 +646,7 @@ end
         end
       rescue => e
         log("Gemini Model #{m} failed: #{e.message}")
-        next 
+        next
       end
     end
     { "error" => "AI Failed to Analyze" }
@@ -663,12 +681,12 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v4.1 (Stable & Multilingual)</title>
+  <title>TGTG AI Hunter v4.2</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
     h1 { color: #00816A; margin-bottom: 20px; }
-    
+
     .controls { display: flex; gap: 15px; margin-bottom: 20px; background: #eefcf9; padding: 20px; border-radius: 8px; border: 1px solid #ccece6; }
     textarea { width: 100%; height: 100px; padding: 12px; border: 1px solid #ddd; border-radius: 6px; font-family: monospace; font-size: 14px; }
     button { background: #00816A; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
@@ -676,7 +694,7 @@ __END__
     button:disabled { background: #ccc; cursor: not-allowed; }
 
     .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #e1e4e8; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 3200px; } 
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 3600px; }
     th { text-align: left; background: #00816A; color: white; padding: 14px 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; font-weight: 600; letter-spacing: 0.5px; }
     td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 300px; line-height: 1.4; }
     tr:nth-child(even) { background: #f8f9fa; }
@@ -684,31 +702,36 @@ __END__
 
     .status-badge { padding: 4px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; text-transform: uppercase; }
     .st-found { background: #d4edda; color: #155724; }
-    .st-deep { background: #cce5ff; color: #004085; }
-    .st-reg { background: #fff3cd; color: #856404; }
-    .st-miss { background: #f8d7da; color: #721c24; }
+    .st-deep  { background: #cce5ff; color: #004085; }
+    .st-reg   { background: #fff3cd; color: #856404; }
+    .st-miss  { background: #f8d7da; color: #721c24; }
     .img-thumb { width: 50px; height: 50px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; padding: 2px; }
 
     .source-list { display: flex; flex-direction: column; gap: 4px; }
-    .src-btn { 
-      display: inline-flex; align-items: center; gap: 5px; 
-      padding: 4px 8px; border-radius: 4px; font-size: 11px; text-decoration: none; 
+    .src-btn {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 4px 8px; border-radius: 4px; font-size: 11px; text-decoration: none;
       border: 1px solid #ced4da; background: #fff; color: #495057; transition: all 0.2s;
       width: fit-content;
     }
     .src-btn:hover { border-color: #00816A; color: #00816A; background: #f0fdf9; }
     .src-registry { border-left: 3px solid #00816A; }
-    .src-web { border-left: 3px solid #007bff; }
-    .src-rescue { border-left: 3px solid #dc3545; }
-    .src-img { border-left: 3px solid #6f42c1; }
+    .src-web      { border-left: 3px solid #007bff; }
+    .src-deep     { border-left: 3px solid #fd7e14; }
+    .src-img      { border-left: 3px solid #6f42c1; }
     .ai-note { font-size: 10px; color: #888; margin-bottom: 5px; font-style: italic; }
+
+    .tag { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin: 1px; }
+    .tag-diet    { background: #d4edda; color: #155724; }
+    .tag-format  { background: #cce5ff; color: #004085; }
+    .tag-occasion{ background: #fff3cd; color: #856404; }
   </style>
 </head>
 <body>
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v4.1 (Stable & Multilingual)</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v4.2</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -718,8 +741,8 @@ __END__
       <textarea id="inputList" placeholder="4018077669132..."></textarea>
     </div>
     <div style="width: 200px;">
-       <label style="font-weight:bold; display:block; margin-bottom:5px;">Market:</label>
-       <select id="marketSelect" style="width:100%; padding:10px; border-radius:6px; border:1px solid #ddd;">
+      <label style="font-weight:bold; display:block; margin-bottom:5px;">Market:</label>
+      <select id="marketSelect" style="width:100%; padding:10px; border-radius:6px; border:1px solid #ddd;">
         <option value="BE">Belgium (BE)</option>
         <option value="DK">Denmark (DK)</option>
         <option value="DE">Germany (DE)</option>
@@ -764,6 +787,9 @@ __END__
           <th>Fiber</th>
           <th>Protein</th>
           <th>Salt</th>
+          <th>Dietary Info</th>
+          <th>Format</th>
+          <th>Occasion</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -788,7 +814,7 @@ __END__
     const rows = lines.map(gtin => {
       const tr = document.createElement('tr');
       let emptyCells = '';
-      for (let i = 0; i < 19; i++) emptyCells += '<td></td>';
+      for (let i = 0; i < 23; i++) emptyCells += '<td></td>';
       tr.innerHTML = `<td><span class="status-badge" style="background:#eee;color:#666;">...</span></td>` + emptyCells;
       tbody.appendChild(tr);
       resultsData.push(null);
@@ -816,7 +842,7 @@ __END__
           renderRow(tr, gtin, data);
         } catch (e) {
           console.error(`Error on EAN ${gtin}:`, e);
-          tr.innerHTML = `<td colspan="20" style="color:red;text-align:center;">Error for ${gtin}</td>`;
+          tr.innerHTML = `<td colspan="24" style="color:red;text-align:center;">Error for ${gtin}</td>`;
         }
         processed++;
         updateProgress();
@@ -830,12 +856,18 @@ __END__
     document.getElementById('progressIndicator').innerText = '✅ Complete';
   }
 
+  function renderTags(val, cssClass) {
+    if (!val || val === '-' || val === 'null') return '-';
+    return String(val).split(',').map(t => t.trim()).filter(Boolean)
+      .map(t => `<span class="tag ${cssClass}">${t}</span>`).join('');
+  }
+
   function renderRow(tr, gtin, data) {
     let sClass = 'st-found';
-    if (data.status.includes('Registry')) sClass = 'st-reg';
-    if (data.status.includes('Deep')) sClass = 'st-deep';
-    if (data.status.includes('Error') || data.status.includes('Missing') ||
-        data.status.includes('Server') || data.status.includes('Blind')) sClass = 'st-miss';
+    if (data.status && data.status.includes('Registry')) sClass = 'st-reg';
+    if (data.status && data.status.includes('Deep'))     sClass = 'st-deep';
+    if (data.status && (data.status.includes('Error') || data.status.includes('Missing') ||
+        data.status.includes('Server') || data.status.includes('Blind'))) sClass = 'st-miss';
 
     const imgHTML = data.image_url
       ? `<a href="${data.image_url}" target="_blank"><img src="${data.image_url}" class="img-thumb"></a>`
@@ -848,7 +880,7 @@ __END__
         let icon = '🔗', cssClass = 'src-web';
         if (src.type === 'registry') { icon = '🏛️'; cssClass = 'src-registry'; }
         if (src.type === 'image')    { icon = '📸'; cssClass = 'src-img'; }
-        if (src.type === 'rescue')   { icon = '🆘'; cssClass = 'src-rescue'; }
+        if (src.type === 'rescue')   { icon = '🔍'; cssClass = 'src-deep'; }
         sourcesHTML += `<a href="${src.url}" target="_blank" class="src-btn ${cssClass}">${icon} ${src.title}</a>`;
       });
     } else {
@@ -864,7 +896,7 @@ __END__
     };
 
     tr.innerHTML = `
-      <td><span class="status-badge ${sClass}">${data.status}</span></td>
+      <td><span class="status-badge ${sClass}">${data.status || '-'}</span></td>
       <td>${imgHTML}</td>
       <td>${gtin}</td>
       <td>${data.brand || '-'}</td>
@@ -884,11 +916,14 @@ __END__
       <td>${data.sugars || '-'}</td>
       <td>${data.fiber || '-'}</td>
       <td>${data.protein || '-'}</td>
-      <td>${data.salt || '-'}</td>`;
+      <td>${data.salt || '-'}</td>
+      <td style="font-size:11px;">${renderTags(data.dietary_info, 'tag-diet')}</td>
+      <td style="font-size:11px;">${renderTags(data.format, 'tag-format')}</td>
+      <td style="font-size:11px;">${renderTags(data.occasion, 'tag-occasion')}</td>`;
   }
 
   function downloadCSV() {
-    let csv = "Status,EAN,Brand,ProductName,Origin,Sources,NetWeight,OrganicID,Ingredients,Allergens,MayContain,NutriScope,Energy,Fat,Saturates,Carbs,Sugars,Fiber,Protein,Salt\n";
+    let csv = "Status,EAN,Brand,ProductName,Origin,Sources,NetWeight,OrganicID,Ingredients,Allergens,MayContain,NutriScope,Energy,Fat,Saturates,Carbs,Sugars,Fiber,Protein,Salt,DietaryInfo,Format,Occasion\n";
     resultsData.filter(Boolean).forEach(row => {
       const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " | ").trim();
       let srcList = "";
@@ -900,7 +935,8 @@ __END__
              `${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},` +
              `${clean(row.nutri_scope)},${clean(row.energy)},${clean(row.fat)},` +
              `${clean(row.saturates)},${clean(row.carbs)},${clean(row.sugars)},` +
-             `${clean(row.fiber)},${clean(row.protein)},${clean(row.salt)}\n`;
+             `${clean(row.fiber)},${clean(row.protein)},${clean(row.salt)},` +
+             `${clean(row.dietary_info)},${clean(row.format)},${clean(row.occasion)}\n`;
     });
     const link = document.createElement("a");
     link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
