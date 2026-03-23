@@ -124,8 +124,7 @@ class MasterDataHunter
 
     # Thread Synchronization Guard
     deadline = Time.now + 25
-    IMAGE_TIMEOUT = 18  # seconds, independent of other threads
-    image_deadline = Time.now + IMAGE_TIMEOUT
+    image_deadline = Time.now + 18
     image_thread.join([image_deadline - Time.now, 0.5].max) if image_thread.alive?
     threads.each do |t|
       remaining = deadline - Time.now
