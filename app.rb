@@ -333,6 +333,18 @@ end
     
     urls = []
     begin
+      # --- NEW STAGE 0: Brand website direct search ---
+      # This finds the manufacturer's own product page which always has complete data
+      brand_res = Timeout.timeout(15) { 
+        GoogleSearch.new(
+          q: "\"#{short_name}\" ingredients nutrition facts #{bans}", 
+          gl: gl, 
+          num: 4, 
+          api_key: SERPAPI_KEY
+        ).get_hash 
+      }
+      (brand_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
+
       # Stage 1: Trusted Local Domains (Using short_name!)
       if goldmine
         res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{short_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
@@ -480,7 +492,13 @@ end
           
           # 2. Check if we hit a wall (Bot Protection or Empty JS Shell)
           is_blocked = [400, 403, 429, 503].include?(response.code)
-          is_js_shell = response.code == 200 && response.body.to_s.length < 1000
+          body = response.body.to_s
+          is_js_shell = response.code == 200 && (
+            body.length < 1000 ||
+           (body.length < 15000 && body.scan(/<script/).length > 10) ||  # JS-heavy with little HTML
+            body.include?("window.ShopifyAnalytics") ||  # Shopify specifically
+            body.include?('"@type":"Product"') == false && body.include?("application/json") && body.length < 5000
+          )
 
           # 3. Escalation: If blocked and ZenRows is available, smash through
           if (is_blocked || is_js_shell) && ZENROWS_API_KEY && !ZENROWS_API_KEY.empty?
@@ -570,12 +588,13 @@ end
       1. Synthesize all data.
       2. **Translation:** Translate Name, Ingredients, and Allergens to **#{target_lang}**.
       3. **BE Specific:** If Market is 'BE', output Ingredients/Allergens in German, French, AND Dutch.
-      4. **Nutrition:** Extract ONLY numeric 100g/ml values. 
-       - If you find text like "low in fat", "high in protein", "low sugar" — these are NOT valid values. Set those fields to null.
-       - Only return actual numbers with units (e.g. "3.2g", "450kJ / 107kcal").
-        - Never return phrases, descriptions, or qualitative terms in nutrition fields.
-        - If a numeric value is genuinely not found anywhere, return null — do NOT return "Not available", "N/A", "Not specified" or similar strings.
-      
+      4. **Nutrition:** Extract ONLY numeric 100g/ml values.
+       - Only return actual numbers with units e.g. "3.2g", "450kJ / 107kcal".
+       - If you find marketing text like "low in fat", "high in protein" — ignore it, set field to null.
+       - If the page content looks like a JavaScript shell or contains no product data, set ALL nutrition fields to null.
+        - Never return "Not available", "N/A", "Not specified" or descriptive phrases in numeric fields.
+      5. **Confidence:** If the scraped text is clearly not a product page (JS shell, error page, unrelated content), 
+      set sources_summary to "WARNING: Source data quality poor - JS shell or unrelated content detected"
       OUTPUT JSON (Strict Schema):
       {
         "brand": "Brand Name",
