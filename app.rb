@@ -515,11 +515,11 @@ class MasterDataHunter
 
           if response && response.code == 200
             doc = Nokogiri::HTML(response.body)
-            doc.css('script, style, nav, footer, iframe, header, .cookie').remove
-            txt = doc.text.gsub(/\s+/, " ").strip[0..8000]
-
             json_ld = ""
-            doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
+            doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }  # extract FIRST
+
+            doc.css('script, style, nav, footer, iframe, header, .cookie').remove  # THEN remove scripts
+            txt = doc.text.gsub(/\s+/, " ").strip[0..8000]
 
             doc = nil
 
@@ -592,6 +592,8 @@ class MasterDataHunter
          Vegetarian, Vegan, Organic, Halal, Kosher, Dairy Free, Nut Free, Low Sugar, High Protein, Gluten Free, Low Fat
          - Deduce from ingredients, certifications, and any text or image evidence.
          - Only include a tag if you are confident it applies. Return null if none apply or cannot be determined.
+         - ONLY apply a dietary tag if there is explicit text or visible certification on the packaging.
+          - Do NOT infer tags from ingredient absence alone (e.g. do not tag "Vegan" just because no meat is listed).
       6. **Format:** Select ONE tag from ONLY this exact list:
          Multipack, Sharing Size, Single
          - Multipack: multiple units sold together e.g. "6 pack", "2x", "box of 12".
