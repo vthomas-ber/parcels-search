@@ -69,7 +69,7 @@ class MasterDataHunter
     # 5. Trusted Retailers
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:openfoodfacts.org",
-      "UK" => "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:mysupermarket.co.uk OR site:tesco.com",
+      "UK" => "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:mysupermarket.co.uk OR site:tesco.com OR site:nutritionix.com OR site:barcodelookup.com OR site:buycott.com",
       "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl",
       "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be",
       "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:motatos.de OR site:picnic.app OR site:dm.de OR site:rossmann.de",
@@ -83,7 +83,7 @@ class MasterDataHunter
       "PL" => "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl"
     }
     # --- NEW: GLOBAL GOLDMINE SITES ---
-    global_sites = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
+    global_sites = "site:billigkaffee.eu OR site:fivestartrading-holland.eu OR site:barcodelookup.com OR site:buycott.com"
 
     # 1. Append the global sites to every existing market's list
     @goldmine_sites.each do |market, sites|
@@ -174,33 +174,39 @@ class MasterDataHunter
       "ei löydy", "non trovato", "non disponibile"
     ]
     
-    if ing_text.length < 10 || missing_phrases.any? { |p| ing_text.include?(p) }
-      log("Fallback Escalation triggered for #{gtin}: Missing/poor ingredients.")
+    nutrition_fields = %w[energy fat saturates carbs sugars protein salt]
+    nutrition_missing = nutrition_fields.count { |f|
+      val = ai_hash[f].to_s.downcase
+      val.empty? || val == "-" || val == "null" || val.include?("not") || val.include?("n/a")
+    }
+
+    if ing_text.length < 10 || missing_phrases.any? { |p| ing_text.include?(p) } || nutrition_missing >= 5
+    log("Fallback Escalation triggered for #{gtin}: Missing/poor ingredients.")
+  
+    search_name = ai_hash["product_name"] || registry_name || infer_name_from_ean(gtin, market)
+  
+    if search_name && search_name.length > 3
+    fallback_urls = find_deep_urls(search_name, market) 
+    
+    if fallback_urls.any?
+      fallback_web_data = fetch_parallel_page_data(fallback_urls)
       
-      search_name = ai_hash["product_name"] || registry_name || infer_name_from_ean(gtin, market)
-      
-      if search_name && search_name.length > 3
-        fallback_urls = find_deep_urls(search_name, market) 
+      if fallback_web_data[:text].length > 200
+        is_deep_search = true
+        combined_text = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_web_data[:text]
+        fallback_web_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
         
-        if fallback_urls.any?
-          fallback_web_data = fetch_parallel_page_data(fallback_urls)
-          
-          if fallback_web_data[:text].length > 200
-            is_deep_search = true
-            combined_text = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_web_data[:text]
-            fallback_web_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
-            
-            ai_result2 = analyze_with_gemini(image_data, combined_text, final_name_context, gtin, market)
-            if ai_result2.is_a?(Hash) && !ai_result2["error"]
-              ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result2[k] if ai_result2.key?(k) }
-            end
-            
-            web_data[:valid_urls] += fallback_web_data[:valid_urls]
-            web_data[:text] = combined_text
-          end
+        ai_result2 = analyze_with_gemini(image_data, combined_text, final_name_context, gtin, market)
+        if ai_result2.is_a?(Hash) && !ai_result2["error"]
+          ALLOWED_KEYS.each { |k| ai_hash[k] = ai_result2[k] if ai_result2.key?(k) }
         end
+        
+        web_data[:valid_urls] += fallback_web_data[:valid_urls]
+        web_data[:text] = combined_text
       end
     end
+  end
+end
 
     origin_country = official_data ? official_data['issuingCountry'] : nil
     display_image = if image_data && image_data[:base64] && image_data[:mime]
@@ -564,7 +570,11 @@ class MasterDataHunter
       1. Synthesize all data.
       2. **Translation:** Translate Name, Ingredients, and Allergens to **#{target_lang}**.
       3. **BE Specific:** If Market is 'BE', output Ingredients/Allergens in German, French, AND Dutch.
-      4. **Nutrition:** Extract 100g/ml values.
+      4. **Nutrition:** Extract ONLY numeric 100g/ml values. 
+       - If you find text like "low in fat", "high in protein", "low sugar" — these are NOT valid values. Set those fields to null.
+       - Only return actual numbers with units (e.g. "3.2g", "450kJ / 107kcal").
+        - Never return phrases, descriptions, or qualitative terms in nutrition fields.
+        - If a numeric value is genuinely not found anywhere, return null — do NOT return "Not available", "N/A", "Not specified" or similar strings.
       
       OUTPUT JSON (Strict Schema):
       {
