@@ -122,7 +122,7 @@ class MasterDataHunter
       # Last resort: search the bare GTIN on trusted sites
       deep_results = find_retailer_urls(gtin, market)
     end
-
+  end
     image_data = nil
     image_thread = Thread.new { image_data = find_best_image(gtin, market, official_data) }
 
