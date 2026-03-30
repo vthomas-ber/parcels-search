@@ -20,12 +20,18 @@ BAD_URL_PATTERNS = %w[
   rezept recipe kuchen torta blog forum pinterest wiki tiktok facebook instagram
   .xml .xml.gz .pdf .zip .gz .csv sitemap
   scribd academia researchgate tamu.edu github trinket joybuy momogo
+  onlinelibrary.wiley pubs.acs.org springer.com sciencedirect ncbi.nlm
+  researchgate pubmed nature.com cell.com
 ].freeze
 
 ALLOWED_KEYS = %w[
-  brand product_name net_weight ingredients allergens may_contain nutri_scope
-  energy fat saturates carbs sugars protein fiber salt organic_id sources_summary
-  dietary_info format occasion
+  brand product_name item_description cn_code uom packaging fragile
+  net_weight_g gross_weight_g organic dietary_info
+  net_weight_display ingredients allergens may_contain
+  nutri_scope energy_kj fat saturates carbs sugars protein fiber salt
+  manufacturer_address place_of_origin organic_id
+  pkg_length pkg_width pkg_height
+  format occasion sources_summary
 ].freeze
 
 class MasterDataHunter
@@ -34,7 +40,6 @@ class MasterDataHunter
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
 
-    # 1. Market Language Logic
     @country_langs = {
       "DE" => "German", "AT" => "German", "CH" => "German",
       "UK" => "English", "GB" => "English", "FR" => "French",
@@ -44,14 +49,12 @@ class MasterDataHunter
       "BE" => "German, French, AND Dutch (Must provide all 3)"
     }
 
-    # 2. Google HL Codes
     @hl_codes = {
       "DE" => "de", "AT" => "de", "CH" => "de", "UK" => "en", "GB" => "en",
       "FR" => "fr", "IT" => "it", "ES" => "es", "NL" => "nl", "BE" => "nl",
       "DK" => "da", "SE" => "sv", "NO" => "no", "PL" => "pl", "PT" => "pt", "FI" => "fi"
     }
 
-    # 3. Localized Deep Search Terms
     @local_search_terms = {
       "FR" => "ingrédients nutrition", "IT" => "ingredienti nutrizionali", "ES" => "ingredientes nutrición",
       "NL" => "ingrediënten voedingswaarde", "DK" => "ingredienser næringsindhold", "SE" => "ingredienser näringsvärde",
@@ -60,7 +63,6 @@ class MasterDataHunter
       "BE" => "ingrédients ingrediënten", "UK" => "ingredients nutrition", "PT" => "ingredientes nutrição"
     }
 
-    # 4. Country Names for Image Hunting
     @country_names = {
       "DE" => "Deutschland Germany", "AT" => "Österreich Austria", "CH" => "Schweiz Switzerland",
       "UK" => "UK United Kingdom",   "GB" => "UK United Kingdom", "FR" => "France",
@@ -69,7 +71,6 @@ class MasterDataHunter
       "SE" => "Sverige Sweden", "NO" => "Norge Norway", "PT" => "Portugal", "FI" => "Suomi Finland"
     }
 
-    # 5. Trusted Retailers per market
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com",
       "UK" => "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:mysupermarket.co.uk OR site:tesco.com",
@@ -160,13 +161,17 @@ class MasterDataHunter
     end
 
     # --- WEB TEXT RELEVANCE CHECK ---
+    # Only warn if BOTH gtin AND name are missing — single check was too aggressive
     relevant_text = web_data[:text]
-    gtin_in_text = web_data[:text].include?(gtin)
-    name_words = (registry_name || "").downcase.split(" ").reject { |w| w.length < 4 }
-    name_in_text = name_words.any? { |w| web_data[:text].downcase.include?(w) }
-    unless gtin_in_text || name_in_text
-      log("Web text relevance check failed for #{gtin} — text may be for wrong product")
-      relevant_text = "WARNING: Web sources may not match this specific product. Cross-reference carefully.\n\n" + web_data[:text]
+    if web_data[:text].length > 100
+      gtin_in_text  = web_data[:text].include?(gtin)
+      name_words    = (registry_name || "").downcase.split(" ").reject { |w| w.length < 4 }
+      name_in_text  = name_words.any? { |w| web_data[:text].downcase.include?(w) }
+      # Only flag if NEITHER gtin NOR any name word found AND we have a registry name to check against
+      if !gtin_in_text && !name_in_text && name_words.length > 0
+        log("Web text relevance check failed for #{gtin} — text may be for wrong product")
+        relevant_text = "WARNING: Web sources may not match this specific product. Cross-reference carefully.\n\n" + web_data[:text]
+      end
     end
 
     # --- STEP 4: AI ANALYSIS ---
@@ -191,7 +196,7 @@ class MasterDataHunter
       "ei löydy", "non trovato", "non disponibile"
     ]
 
-    nutrition_fields = %w[energy fat saturates carbs sugars protein salt]
+    nutrition_fields = %w[energy_kj fat saturates carbs sugars protein salt]
     is_empty_val = ->(v) {
       v.to_s.strip.empty? || v.to_s.strip == "-" ||
       v.to_s.downcase.include?("not") || v.to_s.downcase.include?("n/a") ||
@@ -344,7 +349,7 @@ class MasterDataHunter
 
     urls = []
     begin
-      # Stage 0: Brand website direct search — finds manufacturer's own product page
+      # Stage 0: Brand website direct search
       brand_res = Timeout.timeout(15) {
         GoogleSearch.new(
           q: "\"#{short_name}\" ingredients nutrition facts #{bans}",
@@ -353,7 +358,7 @@ class MasterDataHunter
       }
       (brand_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
 
-      # Stage 1: Trusted goldmine retailers — only if Stage 0 didn't find enough
+      # Stage 1: Trusted goldmine retailers — only if Stage 0 insufficient
       if urls.length < 3 && goldmine
         res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{short_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
@@ -372,7 +377,7 @@ class MasterDataHunter
         (global_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
-      # Stage 4: Non-food fallback for pet/household GTINs
+      # Stage 4: Non-food fallback
       if urls.empty?
         log("Non-food Bypass Triggered for: #{short_name}")
         non_food_sites = "site:zooplus.com OR site:zooplus.de OR site:pets-premium.de OR site:idealo.de OR site:bol.com"
@@ -386,7 +391,6 @@ class MasterDataHunter
     urls.uniq.first(6)
   end
 
-  # --- IMAGE DOWNLOADER ---
   def find_best_image(gtin, market, official_data)
     return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = (market == "UK" ? "gb" : market.downcase)
@@ -475,15 +479,27 @@ class MasterDataHunter
     nil
   end
 
-  # --- PARALLEL SCRAPER ---
   def fetch_parallel_page_data(urls)
     return { text: "", valid_urls: [] } if urls.empty?
+
+    # Deduplicate by domain to avoid burning ZenRows on same site multiple times
+    seen_domains = {}
+    deduped_urls = urls.select do |url|
+      domain = URI.parse(url).host.sub(/^www\./, '') rescue nil
+      next false unless domain
+      if seen_domains[domain] && seen_domains[domain] >= 2
+        false
+      else
+        seen_domains[domain] = (seen_domains[domain] || 0) + 1
+        true
+      end
+    end
 
     threads = []
     results_text = []
     valid_urls = []
 
-    urls.each_with_index do |url, index|
+    deduped_urls.each_with_index do |url, index|
       threads << Thread.new do
         begin
           sleep(index * 0.3)
@@ -521,13 +537,13 @@ class MasterDataHunter
             json_ld = ""
             doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
 
-            # Aggressively strip boilerplate so nutrition isn't pushed past the 8000-char truncation point
+            # Strip boilerplate so nutrition isn't pushed past truncation
             doc.css('script, style, nav, footer, iframe, header, .cookie, .breadcrumb,
                      [class*="related"], [class*="recommend"], [class*="cookie"],
                      [class*="banner"], [class*="promo"], [id*="header"],
                      [id*="footer"], [id*="nav"], [id*="menu"]').remove
 
-            # Prefer product-specific sections over full page text dump
+            # Target product sections specifically
             product_node = doc.at_css(
               '[class*="product-detail"], [class*="ingredient"], [class*="nutrition"],
                [class*="nährwert"], [class*="zutaten"], [id*="product-detail"],
@@ -554,7 +570,6 @@ class MasterDataHunter
       end
     end
 
-    # Join with per-thread timeout so a hanging thread doesn't stall the whole batch
     threads.each { |t| t.join(20) }
 
     threads.each do |t|
@@ -586,7 +601,7 @@ class MasterDataHunter
     confidence_note = image_confidence_note ? "\n#{image_confidence_note}\n" : ""
 
     prompt = <<~TEXT
-      You are a Food Data Expert.
+      You are a Food & Product Data Expert specializing in consumer goods data extraction.
       #{official_txt}
       #{confidence_note}
       INPUT DATA:
@@ -598,52 +613,70 @@ class MasterDataHunter
       - Target Languages: #{target_lang}
 
       TASK:
-      1. Synthesize all data.
-      2. **Translation:** Translate Name, Ingredients, and Allergens to **#{target_lang}**.
-      3. **BE Specific:** If Market is 'BE', output Ingredients/Allergens in German, French, AND Dutch.
+      1. Synthesize ALL available data sources (text, JSON-LD, image).
+      2. **Translation:** Translate product_name, item_description, ingredients, and allergens to **#{target_lang}**.
+      3. **BE Specific:** If Market is 'BE', output those fields in German, French, AND Dutch.
       4. **Nutrition:** Extract ONLY numeric 100g/ml values.
-         - Only return actual numbers with units e.g. "3.2g", "450kJ / 107kcal".
-         - If you find marketing text like "low in fat", "high in protein" — ignore it, set field to null.
-         - If page content looks like a JS shell with no product data, set ALL nutrition fields to null.
-         - Never return "Not available", "N/A", "Not specified" or descriptive phrases in numeric fields.
-      5. **Dietary Info:** Select ALL applicable tags from ONLY this exact list (return as comma-separated string):
+         - Only return actual numbers with units e.g. "3.2g", "450kJ".
+         - Marketing text like "low in fat" = ignore, set null.
+         - JS shell pages with no product data = set ALL nutrition null.
+         - Never return "Not available", "N/A", "Not specified" in numeric fields.
+      5. **Dietary Info:** Select ALL applicable from ONLY this list (comma-separated):
          Vegetarian, Vegan, Organic, Halal, Kosher, Dairy Free, Nut Free, Low Sugar, High Protein, Gluten Free, Low Fat
-         - ONLY apply a tag if there is explicit text or visible certification on the packaging or product page.
-         - Do NOT infer tags from ingredient absence alone (e.g. do not tag "Vegan" just because no meat is listed).
-         - Return null if no tags can be confirmed with explicit evidence.
-      6. **Format:** Select ONE tag from ONLY this exact list:
+         - ONLY tag if explicit text/certification confirms it. No inference from ingredient absence.
+         - Return null if nothing confirmed.
+      6. **Format:** Select ONE from ONLY this list:
          Multipack, Sharing Size, Single
-         - Multipack: multiple units sold together e.g. "6 pack", "2x", "box of 12".
-         - Sharing Size: single large unit clearly intended for sharing e.g. 200g+ bags, family size.
-         - Single: individual portion or on-the-go size.
-         - Deduce from net weight, product name, and packaging description.
-      7. **Occasion:** Select ALL applicable tags from ONLY this exact list (return as comma-separated string):
+         - Multipack: multiple units e.g. "6 pack", "2x", "box of 12".
+         - Sharing Size: large single unit for sharing e.g. 200g+ bags, family size.
+         - Single: individual/on-the-go portion.
+      7. **Occasion:** Select ALL applicable from ONLY this list (comma-separated):
          Breakfast, Lunchbox, BBQ, Party, Christmas, Ramadan, Meal Prep, Quick Dinner, Kids Snack
-         - Deduce from product type, ingredients, name, and any marketing text.
-         - Only include tags you are confident about. Return null if none clearly apply.
+         - Only confident deductions. Return null if unclear.
+      8. **Packaging dimensions:** Extract length/width/height in mm if available anywhere in text or image.
+      9. **Manufacturer & Origin:** Extract full manufacturer address and country of origin if visible.
+      10. **CN Code:** Extract the customs/tariff CN code if mentioned anywhere.
+      11. **UoM:** Unit of Measure — typically "EA" (each) for consumer units.
+      12. **Packaging type:** e.g. "Bottle", "Can", "Bag", "Box", "Jar", "Pouch", "Carton".
+      13. **Fragile:** Return "Yes" if product is glass, ceramic, or otherwise fragile. Otherwise "No".
+      14. **Organic:** Return "Yes" if product is certified organic. Otherwise "No".
+      15. **Gross weight:** Estimate gross weight in grams (net weight + ~20% for packaging) if net weight known.
 
-      OUTPUT JSON (Strict Schema — no extra keys, no markdown):
+      OUTPUT JSON (Strict Schema — no extra keys, no markdown fences):
       {
         "brand": "Brand Name",
-        "product_name": "Name (Translated)",
-        "net_weight": "Value",
-        "ingredients": "List (Translated)",
-        "allergens": "List (Translated)",
-        "may_contain": "List (Translated)",
-        "nutri_scope": "100g",
-        "energy": "kJ/kcal",
-        "fat": "val",
-        "saturates": "val",
-        "carbs": "val",
-        "sugars": "val",
-        "protein": "val",
-        "fiber": "val",
-        "salt": "val",
-        "organic_id": "Code",
+        "product_name": "Full product name translated",
+        "item_description": "Short 1-line product description translated",
+        "cn_code": "CN/HS tariff code if found, else null",
+        "uom": "EA",
+        "packaging": "Bottle/Can/Bag/Box/Jar/Pouch/Carton/etc",
+        "fragile": "Yes or No",
+        "net_weight_g": "numeric grams only e.g. 330",
+        "gross_weight_g": "estimated numeric grams only",
+        "organic": "Yes or No",
         "dietary_info": "Vegetarian, Gluten Free",
+        "net_weight_display": "consumer-facing e.g. 330ml or 150g",
+        "ingredients": "full list translated",
+        "allergens": "list translated",
+        "may_contain": "list translated",
+        "nutri_scope": "100g or 100ml",
+        "energy_kj": "numeric only e.g. 450",
+        "fat": "numeric e.g. 3.2g",
+        "saturates": "numeric e.g. 1.1g",
+        "carbs": "numeric e.g. 12g",
+        "sugars": "numeric e.g. 8g",
+        "protein": "numeric e.g. 2.1g",
+        "fiber": "numeric e.g. 1.4g",
+        "salt": "numeric e.g. 0.3g",
+        "manufacturer_address": "Full address of manufacturer",
+        "place_of_origin": "Country or region of origin",
+        "organic_id": "Organic certification code if present",
+        "pkg_length": "mm if found else null",
+        "pkg_width": "mm if found else null",
+        "pkg_height": "mm if found else null",
         "format": "Single",
         "occasion": "Lunchbox, Kids Snack",
-        "sources_summary": "Source description"
+        "sources_summary": "Brief description of data sources used"
       }
     TEXT
 
@@ -700,7 +733,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v4.3</title>
+  <title>TGTG AI Hunter v4.4</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -713,23 +746,23 @@ __END__
     button:disabled { background: #ccc; cursor: not-allowed; }
 
     .table-wrapper { overflow-x: auto; margin-top: 25px; border: 1px solid #e1e4e8; border-radius: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 3600px; }
-    th { text-align: left; background: #00816A; color: white; padding: 14px 12px; position: sticky; left: 0; z-index: 10; white-space: nowrap; font-weight: 600; letter-spacing: 0.5px; }
-    td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 300px; line-height: 1.4; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 5000px; }
+    th { text-align: left; background: #00816A; color: white; padding: 12px 10px; white-space: nowrap; font-weight: 600; letter-spacing: 0.4px; }
+    td { padding: 10px; border-bottom: 1px solid #eee; vertical-align: top; max-width: 280px; line-height: 1.4; }
     tr:nth-child(even) { background: #f8f9fa; }
     tr:hover { background: #f1f3f5; }
 
-    .status-badge { padding: 4px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; text-transform: uppercase; }
+    .status-badge { padding: 3px 7px; border-radius: 4px; font-weight: 600; font-size: 10px; text-transform: uppercase; white-space: nowrap; }
     .st-found { background: #d4edda; color: #155724; }
     .st-deep  { background: #cce5ff; color: #004085; }
     .st-reg   { background: #fff3cd; color: #856404; }
     .st-miss  { background: #f8d7da; color: #721c24; }
-    .img-thumb { width: 50px; height: 50px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; padding: 2px; }
+    .img-thumb { width: 48px; height: 48px; object-fit: contain; border: 1px solid #ddd; border-radius: 4px; background: white; padding: 2px; }
 
-    .source-list { display: flex; flex-direction: column; gap: 4px; }
+    .source-list { display: flex; flex-direction: column; gap: 3px; }
     .src-btn {
-      display: inline-flex; align-items: center; gap: 5px;
-      padding: 4px 8px; border-radius: 4px; font-size: 11px; text-decoration: none;
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 7px; border-radius: 4px; font-size: 10px; text-decoration: none;
       border: 1px solid #ced4da; background: #fff; color: #495057; transition: all 0.2s;
       width: fit-content;
     }
@@ -738,19 +771,26 @@ __END__
     .src-web      { border-left: 3px solid #007bff; }
     .src-deep     { border-left: 3px solid #fd7e14; }
     .src-img      { border-left: 3px solid #6f42c1; }
-    .ai-note { font-size: 10px; color: #888; margin-bottom: 5px; font-style: italic; }
+    .ai-note { font-size: 10px; color: #888; margin-bottom: 4px; font-style: italic; }
 
-    .tag { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin: 1px; }
+    .tag { display: inline-block; padding: 2px 5px; border-radius: 3px; font-size: 10px; font-weight: 600; margin: 1px; }
     .tag-diet     { background: #d4edda; color: #155724; }
     .tag-format   { background: #cce5ff; color: #004085; }
     .tag-occasion { background: #fff3cd; color: #856404; }
+    .tag-yn-yes   { background: #d4edda; color: #155724; }
+    .tag-yn-no    { background: #f8f9fa; color: #6c757d; }
+
+    th.group-logistics  { background: #005a4a; }
+    th.group-product    { background: #00816A; }
+    th.group-nutrition  { background: #006657; }
+    th.group-packaging  { background: #004d3b; }
   </style>
 </head>
 <body>
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v4.3</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v4.4</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
@@ -785,30 +825,49 @@ __END__
     <table id="resultsTable">
       <thead>
         <tr>
-          <th>Status</th>
-          <th>Image</th>
-          <th>EAN</th>
-          <th>Brand</th>
-          <th>Product Name</th>
-          <th>Origin</th>
-          <th>Sources</th>
-          <th>Net Weight</th>
-          <th>Organic ID</th>
-          <th>Ingredients</th>
-          <th>Allergens</th>
-          <th>May Contain</th>
-          <th>Nutri Scope</th>
-          <th>Energy</th>
-          <th>Fat</th>
-          <th>Saturates</th>
-          <th>Carbs</th>
-          <th>Sugars</th>
-          <th>Fiber</th>
-          <th>Protein</th>
-          <th>Salt</th>
-          <th>Dietary Info</th>
-          <th>Format</th>
-          <th>Occasion</th>
+          <!-- Identity -->
+          <th class="group-product">Status</th>
+          <th class="group-product">Image</th>
+          <th class="group-product">GTIN / EAN</th>
+          <th class="group-product">Brand</th>
+          <th class="group-product">Product Name</th>
+          <th class="group-product">Item Description</th>
+          <th class="group-product">Origin</th>
+          <th class="group-product">Sources</th>
+          <!-- Logistics -->
+          <th class="group-logistics">CN Code</th>
+          <th class="group-logistics">UoM</th>
+          <th class="group-logistics">Packaging</th>
+          <th class="group-logistics">Fragile</th>
+          <th class="group-logistics">Net Weight (g)</th>
+          <th class="group-logistics">Gross Weight (g)</th>
+          <th class="group-logistics">Net Weight Display</th>
+          <th class="group-logistics">Organic</th>
+          <!-- Product detail -->
+          <th class="group-product">Dietary Info</th>
+          <th class="group-product">Organic ID</th>
+          <th class="group-product">Ingredients</th>
+          <th class="group-product">Allergens</th>
+          <th class="group-product">May Contain</th>
+          <th class="group-product">Manufacturer Address</th>
+          <th class="group-product">Place of Origin</th>
+          <!-- Nutrition -->
+          <th class="group-nutrition">Nutri Scope</th>
+          <th class="group-nutrition">Energy (kJ)</th>
+          <th class="group-nutrition">Fat (g)</th>
+          <th class="group-nutrition">Saturates (g)</th>
+          <th class="group-nutrition">Carbs (g)</th>
+          <th class="group-nutrition">Sugars (g)</th>
+          <th class="group-nutrition">Fiber (g)</th>
+          <th class="group-nutrition">Protein (g)</th>
+          <th class="group-nutrition">Salt (g)</th>
+          <!-- Packaging dims -->
+          <th class="group-packaging">Pkg Length (mm)</th>
+          <th class="group-packaging">Pkg Width (mm)</th>
+          <th class="group-packaging">Pkg Height (mm)</th>
+          <!-- Classification -->
+          <th class="group-product">Format</th>
+          <th class="group-product">Occasion</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -830,10 +889,11 @@ __END__
     tbody.innerHTML = '';
     resultsData = [];
 
+    const TOTAL_COLS = 37;
     const rows = lines.map(gtin => {
       const tr = document.createElement('tr');
       let emptyCells = '';
-      for (let i = 0; i < 23; i++) emptyCells += '<td></td>';
+      for (let i = 0; i < TOTAL_COLS - 1; i++) emptyCells += '<td></td>';
       tr.innerHTML = `<td><span class="status-badge" style="background:#eee;color:#666;">...</span></td>` + emptyCells;
       tbody.appendChild(tr);
       resultsData.push(null);
@@ -861,7 +921,7 @@ __END__
           renderRow(tr, gtin, data);
         } catch (e) {
           console.error(`Error on EAN ${gtin}:`, e);
-          tr.innerHTML = `<td colspan="24" style="color:red;text-align:center;">Error for ${gtin}</td>`;
+          tr.innerHTML = `<td colspan="${TOTAL_COLS}" style="color:red;text-align:center;">Error for ${gtin}</td>`;
         }
         processed++;
         updateProgress();
@@ -879,6 +939,13 @@ __END__
     if (!val || val === '-' || val === 'null') return '-';
     return String(val).split(',').map(t => t.trim()).filter(Boolean)
       .map(t => `<span class="tag ${cssClass}">${t}</span>`).join('');
+  }
+
+  function renderYN(val) {
+    if (!val || val === '-' || val === 'null') return '-';
+    const v = String(val).trim();
+    const cls = v.toLowerCase() === 'yes' ? 'tag-yn-yes' : 'tag-yn-no';
+    return `<span class="tag ${cls}">${v}</span>`;
   }
 
   function renderRow(tr, gtin, data) {
@@ -908,55 +975,87 @@ __END__
     sourcesHTML += `</div>`;
 
     const fmt = (val) => {
-      if (!val) return '-';
+      if (val === null || val === undefined) return '-';
       if (Array.isArray(val)) val = val.join(', ');
       if (typeof val === 'object') val = JSON.stringify(val);
-      return String(val).replace(/\n/g, '<br>');
+      const s = String(val).trim();
+      return s === '' || s === 'null' ? '-' : s.replace(/\n/g, '<br>');
     };
 
     tr.innerHTML = `
       <td><span class="status-badge ${sClass}">${data.status || '-'}</span></td>
       <td>${imgHTML}</td>
-      <td>${gtin}</td>
-      <td>${data.brand || '-'}</td>
-      <td style="font-weight:bold;">${data.product_name || '-'}</td>
-      <td style="text-align:center;">${data.issuing_country || '-'}</td>
+      <td style="font-family:monospace;font-size:11px;">${gtin}</td>
+      <td>${fmt(data.brand)}</td>
+      <td style="font-weight:600;">${fmt(data.product_name)}</td>
+      <td style="font-size:11px;">${fmt(data.item_description)}</td>
+      <td style="text-align:center;">${fmt(data.issuing_country)}</td>
       <td>${sourcesHTML}</td>
-      <td>${data.net_weight || '-'}</td>
-      <td>${data.organic_id || '-'}</td>
+      <td style="font-family:monospace;">${fmt(data.cn_code)}</td>
+      <td>${fmt(data.uom)}</td>
+      <td>${fmt(data.packaging)}</td>
+      <td>${renderYN(data.fragile)}</td>
+      <td>${fmt(data.net_weight_g)}</td>
+      <td>${fmt(data.gross_weight_g)}</td>
+      <td>${fmt(data.net_weight_display)}</td>
+      <td>${renderYN(data.organic)}</td>
+      <td>${renderTags(data.dietary_info, 'tag-diet')}</td>
+      <td style="font-family:monospace;font-size:11px;">${fmt(data.organic_id)}</td>
       <td style="font-size:11px;">${fmt(data.ingredients)}</td>
       <td style="font-size:11px;">${fmt(data.allergens)}</td>
       <td style="font-size:11px;">${fmt(data.may_contain)}</td>
-      <td>${data.nutri_scope || '-'}</td>
-      <td>${data.energy || '-'}</td>
-      <td>${data.fat || '-'}</td>
-      <td>${data.saturates || '-'}</td>
-      <td>${data.carbs || '-'}</td>
-      <td>${data.sugars || '-'}</td>
-      <td>${data.fiber || '-'}</td>
-      <td>${data.protein || '-'}</td>
-      <td>${data.salt || '-'}</td>
-      <td style="font-size:11px;">${renderTags(data.dietary_info, 'tag-diet')}</td>
-      <td style="font-size:11px;">${renderTags(data.format, 'tag-format')}</td>
-      <td style="font-size:11px;">${renderTags(data.occasion, 'tag-occasion')}</td>`;
+      <td style="font-size:11px;">${fmt(data.manufacturer_address)}</td>
+      <td>${fmt(data.place_of_origin)}</td>
+      <td>${fmt(data.nutri_scope)}</td>
+      <td>${fmt(data.energy_kj)}</td>
+      <td>${fmt(data.fat)}</td>
+      <td>${fmt(data.saturates)}</td>
+      <td>${fmt(data.carbs)}</td>
+      <td>${fmt(data.sugars)}</td>
+      <td>${fmt(data.fiber)}</td>
+      <td>${fmt(data.protein)}</td>
+      <td>${fmt(data.salt)}</td>
+      <td>${fmt(data.pkg_length)}</td>
+      <td>${fmt(data.pkg_width)}</td>
+      <td>${fmt(data.pkg_height)}</td>
+      <td>${renderTags(data.format, 'tag-format')}</td>
+      <td>${renderTags(data.occasion, 'tag-occasion')}</td>`;
   }
 
   function downloadCSV() {
-    let csv = "Status,EAN,Brand,ProductName,Origin,Sources,NetWeight,OrganicID,Ingredients,Allergens,MayContain,NutriScope,Energy,Fat,Saturates,Carbs,Sugars,Fiber,Protein,Salt,DietaryInfo,Format,Occasion\n";
+    const headers = [
+      "Status","GTIN/EAN","Brand","Product Name","Item Description","Origin","Sources",
+      "CN Code","UoM","Packaging","Fragile","Net Weight (g)","Gross Weight (g)",
+      "Net Weight Display","Organic","Dietary Info","Organic ID",
+      "Ingredients","Allergens","May Contain","Manufacturer Address","Place of Origin",
+      "Nutri Scope","Energy (kJ)","Fat (g)","Saturates (g)","Carbs (g)","Sugars (g)",
+      "Fiber (g)","Protein (g)","Salt (g)",
+      "Pkg Length (mm)","Pkg Width (mm)","Pkg Height (mm)",
+      "Format","Occasion"
+    ];
+    let csv = headers.join(",") + "\n";
+
     resultsData.filter(Boolean).forEach(row => {
-      const clean = (txt) => (txt || "-").toString().replace(/,/g, " ").replace(/\n/g, " | ").trim();
-      let srcList = "";
-      if (row.defined_sources) {
-        srcList = row.defined_sources.map(s => `[${s.type.toUpperCase()}: ${s.url}]`).join(" | ");
-      }
-      csv += `${row.status},${row.gtin},${clean(row.brand)},${clean(row.product_name)},${clean(row.issuing_country)},` +
-             `${srcList},${clean(row.net_weight)},${clean(row.organic_id)},` +
-             `${clean(row.ingredients)},${clean(row.allergens)},${clean(row.may_contain)},` +
-             `${clean(row.nutri_scope)},${clean(row.energy)},${clean(row.fat)},` +
-             `${clean(row.saturates)},${clean(row.carbs)},${clean(row.sugars)},` +
-             `${clean(row.fiber)},${clean(row.protein)},${clean(row.salt)},` +
-             `${clean(row.dietary_info)},${clean(row.format)},${clean(row.occasion)}\n`;
+      const c = (txt) => {
+        const s = (txt === null || txt === undefined) ? "" : String(txt);
+        return '"' + s.replace(/"/g, '""').replace(/\n/g, ' | ') + '"';
+      };
+      let srcList = (row.defined_sources || []).map(s => `[${s.type.toUpperCase()}: ${s.url}]`).join(" | ");
+      csv += [
+        c(row.status), c(row.gtin), c(row.brand), c(row.product_name), c(row.item_description),
+        c(row.issuing_country), c(srcList),
+        c(row.cn_code), c(row.uom), c(row.packaging), c(row.fragile),
+        c(row.net_weight_g), c(row.gross_weight_g), c(row.net_weight_display), c(row.organic),
+        c(row.dietary_info), c(row.organic_id),
+        c(row.ingredients), c(row.allergens), c(row.may_contain),
+        c(row.manufacturer_address), c(row.place_of_origin),
+        c(row.nutri_scope), c(row.energy_kj), c(row.fat), c(row.saturates),
+        c(row.carbs), c(row.sugars), c(row.fiber), c(row.protein), c(row.salt),
+        c(row.pkg_length), c(row.pkg_width), c(row.pkg_height),
+        c(row.format), c(row.occasion)
+      ].join(",") + "\n";
     });
+
     const link = document.createElement("a");
     link.href = "data:text/csv;charset=utf-8," + encodeURI(csv);
     link.download = "tgtg_hunter_results.csv";
