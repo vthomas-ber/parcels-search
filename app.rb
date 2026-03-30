@@ -34,7 +34,7 @@ class MasterDataHunter
   def initialize
     @headers = { 'Content-Type' => 'application/json' }
 
-    # 1. Market Language Logic (For Gemini AI Prompt)
+    # 1. Market Language Logic
     @country_langs = {
       "DE" => "German", "AT" => "German", "CH" => "German",
       "UK" => "English", "GB" => "English", "FR" => "French",
@@ -44,7 +44,7 @@ class MasterDataHunter
       "BE" => "German, French, AND Dutch (Must provide all 3)"
     }
 
-    # 2. Google HL Codes (2-letter codes for SerpAPI Image Search)
+    # 2. Google HL Codes
     @hl_codes = {
       "DE" => "de", "AT" => "de", "CH" => "de", "UK" => "en", "GB" => "en",
       "FR" => "fr", "IT" => "it", "ES" => "es", "NL" => "nl", "BE" => "nl",
@@ -60,7 +60,7 @@ class MasterDataHunter
       "BE" => "ingrédients ingrediënten", "UK" => "ingredients nutrition", "PT" => "ingredientes nutrição"
     }
 
-    # 4. Country Names for Strict Image Hunting
+    # 4. Country Names for Image Hunting
     @country_names = {
       "DE" => "Deutschland Germany", "AT" => "Österreich Austria", "CH" => "Schweiz Switzerland",
       "UK" => "UK United Kingdom",   "GB" => "UK United Kingdom", "FR" => "France",
@@ -69,7 +69,7 @@ class MasterDataHunter
       "SE" => "Sverige Sweden", "NO" => "Norge Norway", "PT" => "Portugal", "FI" => "Suomi Finland"
     }
 
-    # 5. Trusted Retailers
+    # 5. Trusted Retailers per market
     @goldmine_sites = {
       "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com",
       "UK" => "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:mysupermarket.co.uk OR site:tesco.com",
@@ -86,11 +86,8 @@ class MasterDataHunter
       "PL" => "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl"
     }
 
-    # Global goldmine sites appended to every market
     global_sites = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
-    @goldmine_sites.each do |market, sites|
-      @goldmine_sites[market] = "#{sites} OR #{global_sites}"
-    end
+    @goldmine_sites.each { |market, sites| @goldmine_sites[market] = "#{sites} OR #{global_sites}" }
     @goldmine_sites.default = global_sites
   end
 
@@ -119,7 +116,6 @@ class MasterDataHunter
       if search_name
         deep_results = find_deep_urls(search_name, market)
       else
-        # Last resort: search the bare GTIN on trusted sites
         deep_results = find_retailer_urls(gtin, market)
       end
     end
@@ -127,7 +123,6 @@ class MasterDataHunter
     image_data = nil
     image_thread = Thread.new { image_data = find_best_image(gtin, market, official_data) }
 
-    # Thread Synchronization Guard — image has its own deadline
     deadline = Time.now + 25
     image_deadline = Time.now + 18
     image_thread.join([image_deadline - Time.now, 0.5].max) if image_thread.alive?
@@ -164,8 +159,18 @@ class MasterDataHunter
       end
     end
 
+    # --- WEB TEXT RELEVANCE CHECK ---
+    relevant_text = web_data[:text]
+    gtin_in_text = web_data[:text].include?(gtin)
+    name_words = (registry_name || "").downcase.split(" ").reject { |w| w.length < 4 }
+    name_in_text = name_words.any? { |w| web_data[:text].downcase.include?(w) }
+    unless gtin_in_text || name_in_text
+      log("Web text relevance check failed for #{gtin} — text may be for wrong product")
+      relevant_text = "WARNING: Web sources may not match this specific product. Cross-reference carefully.\n\n" + web_data[:text]
+    end
+
     # --- STEP 4: AI ANALYSIS ---
-    ai_result = analyze_with_gemini(image_data, web_data[:text], final_name_context, gtin, market, image_confidence_note)
+    ai_result = analyze_with_gemini(image_data, relevant_text, final_name_context, gtin, market, image_confidence_note)
 
     ai_hash = {}
     if ai_result.is_a?(Hash)
@@ -187,11 +192,15 @@ class MasterDataHunter
     ]
 
     nutrition_fields = %w[energy fat saturates carbs sugars protein salt]
-    is_empty_val = ->(v) { v.to_s.strip.empty? || v.to_s.strip == "-" || v.to_s.downcase.include?("not") || v.to_s.downcase.include?("n/a") || v.to_s.downcase == "null" }
+    is_empty_val = ->(v) {
+      v.to_s.strip.empty? || v.to_s.strip == "-" ||
+      v.to_s.downcase.include?("not") || v.to_s.downcase.include?("n/a") ||
+      v.to_s.downcase == "null"
+    }
     nutrition_missing = nutrition_fields.count { |f| is_empty_val.call(ai_hash[f]) }
 
     if ing_text.length < 10 || missing_phrases.any? { |p| ing_text.include?(p) } || nutrition_missing >= 5
-      log("Fallback Escalation triggered for #{gtin}: Missing/poor ingredients or nutrition (#{nutrition_missing}/7 nutrition fields empty).")
+      log("Fallback Escalation triggered for #{gtin}: Missing/poor ingredients or nutrition (#{nutrition_missing}/7 empty).")
 
       search_name = ai_hash["product_name"] || registry_name || infer_name_from_ean(gtin, market)
 
@@ -203,7 +212,7 @@ class MasterDataHunter
 
           if fallback_web_data[:text].length > 200
             is_deep_search = true
-            combined_text = web_data[:text] + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_web_data[:text]
+            combined_text = relevant_text + "\n\n=== FALLBACK NAME SEARCH DATA ===\n" + fallback_web_data[:text]
             fallback_web_data[:valid_urls].each { |u| confirmed_sources << { type: "rescue", title: host_from_url(u), url: u } }
 
             ai_result2 = analyze_with_gemini(image_data, combined_text, final_name_context, gtin, market, image_confidence_note)
@@ -212,13 +221,12 @@ class MasterDataHunter
                 next unless ai_result2.key?(k)
                 new_val = ai_result2[k].to_s.strip
                 old_val = ai_hash[k].to_s.strip
-                # Only update if new value is meaningfully better than what we have
                 ai_hash[k] = ai_result2[k] if is_empty_val.call(old_val) || (!is_empty_val.call(new_val) && new_val.length > old_val.length)
               end
             end
 
             web_data[:valid_urls] += fallback_web_data[:valid_urls]
-            web_data[:text] = combined_text
+            relevant_text = combined_text
           end
         end
       end
@@ -232,8 +240,8 @@ class MasterDataHunter
                     end
 
     has_registry = !!official_data
-    has_image = image_data && image_data[:base64]
-    has_web = web_data[:valid_urls].any? && web_data[:text].length > 200
+    has_image    = image_data && image_data[:base64]
+    has_web      = web_data[:valid_urls].any? && web_data[:text].length > 200
 
     computed_status = if is_deep_search
                         "Found (Deep Search)"
@@ -329,47 +337,42 @@ class MasterDataHunter
     gl = (market == "UK" ? "gb" : market.downcase)
 
     bans = "-site:openfoodfacts.org -site:pinterest.* -site:tiktok.com -site:facebook.com -site:instagram.com"
-
     clean_name = name.gsub(/[^a-zA-Z0-9\s]/, '').gsub(/\s+/, ' ').strip
     short_name = clean_name.split(' ')[0..3].join(" ")
-
     goldmine = @goldmine_sites[market]
     local_terms = @local_search_terms[market] || "ingredients nutrition"
 
     urls = []
     begin
-      # --- STAGE 0: Brand website direct search ---
-      # Finds the manufacturer's own product page which always has the most complete data
+      # Stage 0: Brand website direct search — finds manufacturer's own product page
       brand_res = Timeout.timeout(15) {
         GoogleSearch.new(
           q: "\"#{short_name}\" ingredients nutrition facts #{bans}",
-          gl: gl,
-          num: 4,
-          api_key: SERPAPI_KEY
+          gl: gl, num: 4, api_key: SERPAPI_KEY
         ).get_hash
       }
       (brand_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
 
-      # Stage 1: Trusted Local Domains
-      if goldmine
+      # Stage 1: Trusted goldmine retailers — only if Stage 0 didn't find enough
+      if urls.length < 3 && goldmine
         res = Timeout.timeout(15) { GoogleSearch.new(q: "#{goldmine} #{short_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
-      # Stage 2: Broad Local Search
+      # Stage 2: Broad local search
       if urls.empty?
         res = Timeout.timeout(15) { GoogleSearch.new(q: "#{short_name} #{local_terms} #{bans}", gl: gl, num: 6, api_key: SERPAPI_KEY).get_hash }
         (res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
-      # Stage 3: Global Bypass
+      # Stage 3: Global bypass
       if urls.empty?
         log("Global Bypass Triggered for: #{short_name}")
         global_res = Timeout.timeout(15) { GoogleSearch.new(q: "#{short_name} ingredients nutrition #{bans}", num: 6, api_key: SERPAPI_KEY).get_hash }
         (global_res[:organic_results] || []).each { |r| urls << r[:link] if is_clean_url?(r[:link]) }
       end
 
-      # Stage 4: Non-food fallback for pet/household/non-food GTINs
+      # Stage 4: Non-food fallback for pet/household GTINs
       if urls.empty?
         log("Non-food Bypass Triggered for: #{short_name}")
         non_food_sites = "site:zooplus.com OR site:zooplus.de OR site:pets-premium.de OR site:idealo.de OR site:bol.com"
@@ -383,7 +386,7 @@ class MasterDataHunter
     urls.uniq.first(6)
   end
 
-  # --- ULTIMATE 5-TIER IMAGE DOWNLOADER ---
+  # --- IMAGE DOWNLOADER ---
   def find_best_image(gtin, market, official_data)
     return nil if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = (market == "UK" ? "gb" : market.downcase)
@@ -472,7 +475,7 @@ class MasterDataHunter
     nil
   end
 
-  # --- PARALLEL SCRAPER (With Conditional ZenRows Escalation) ---
+  # --- PARALLEL SCRAPER ---
   def fetch_parallel_page_data(urls)
     return { text: "", valid_urls: [] } if urls.empty?
 
@@ -490,7 +493,6 @@ class MasterDataHunter
 
           body = response.body.to_s
           is_blocked = [400, 403, 429, 503].include?(response.code)
-          # Enhanced JS shell detection — catches Shopify and similar JS-heavy stores
           is_js_shell = response.code == 200 && (
             body.length < 1000 ||
             (body.length < 15000 && body.scan(/<script/).length > 10) ||
@@ -499,7 +501,6 @@ class MasterDataHunter
 
           if (is_blocked || is_js_shell) && ZENROWS_API_KEY && !ZENROWS_API_KEY.empty?
             log("Wall detected on #{url} (Code: #{response.code}). Escalating to ZenRows...")
-
             api_url = "https://api.zenrows.com/v1/"
             query_params = {
               apikey:        ZENROWS_API_KEY,
@@ -515,11 +516,28 @@ class MasterDataHunter
 
           if response && response.code == 200
             doc = Nokogiri::HTML(response.body)
-            json_ld = ""
-            doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }  # extract FIRST
 
-            doc.css('script, style, nav, footer, iframe, header, .cookie').remove  # THEN remove scripts
-            txt = doc.text.gsub(/\s+/, " ").strip[0..8000]
+            # Extract JSON-LD FIRST before removing scripts
+            json_ld = ""
+            doc.css('script[type="application/ld+json"]').each { |s| json_ld += s.content.to_s.gsub(/\s+/, " ").strip[0..3000] + " " }
+
+            # Aggressively strip boilerplate so nutrition isn't pushed past the 8000-char truncation point
+            doc.css('script, style, nav, footer, iframe, header, .cookie, .breadcrumb,
+                     [class*="related"], [class*="recommend"], [class*="cookie"],
+                     [class*="banner"], [class*="promo"], [id*="header"],
+                     [id*="footer"], [id*="nav"], [id*="menu"]').remove
+
+            # Prefer product-specific sections over full page text dump
+            product_node = doc.at_css(
+              '[class*="product-detail"], [class*="ingredient"], [class*="nutrition"],
+               [class*="nährwert"], [class*="zutaten"], [id*="product-detail"],
+               [itemtype*="Product"]'
+            )
+            txt = if product_node
+                    product_node.text.gsub(/\s+/, " ").strip[0..8000]
+                  else
+                    doc.text.gsub(/\s+/, " ").strip[0..8000]
+                  end
 
             doc = nil
 
@@ -536,7 +554,8 @@ class MasterDataHunter
       end
     end
 
-    threads.each(&:join)
+    # Join with per-thread timeout so a hanging thread doesn't stall the whole batch
+    threads.each { |t| t.join(20) }
 
     threads.each do |t|
       if t[:valid]
@@ -564,7 +583,6 @@ class MasterDataHunter
     target_lang = @country_langs[market] || "English"
     name_info = official ? official['name'] : (official.is_a?(Hash) ? official['name'] : "Unknown")
     official_txt = "PRODUCT IDENTITY: #{name_info}"
-
     confidence_note = image_confidence_note ? "\n#{image_confidence_note}\n" : ""
 
     prompt = <<~TEXT
@@ -590,10 +608,9 @@ class MasterDataHunter
          - Never return "Not available", "N/A", "Not specified" or descriptive phrases in numeric fields.
       5. **Dietary Info:** Select ALL applicable tags from ONLY this exact list (return as comma-separated string):
          Vegetarian, Vegan, Organic, Halal, Kosher, Dairy Free, Nut Free, Low Sugar, High Protein, Gluten Free, Low Fat
-         - Deduce from ingredients, certifications, and any text or image evidence.
-         - Only include a tag if you are confident it applies. Return null if none apply or cannot be determined.
-         - ONLY apply a dietary tag if there is explicit text or visible certification on the packaging.
-          - Do NOT infer tags from ingredient absence alone (e.g. do not tag "Vegan" just because no meat is listed).
+         - ONLY apply a tag if there is explicit text or visible certification on the packaging or product page.
+         - Do NOT infer tags from ingredient absence alone (e.g. do not tag "Vegan" just because no meat is listed).
+         - Return null if no tags can be confirmed with explicit evidence.
       6. **Format:** Select ONE tag from ONLY this exact list:
          Multipack, Sharing Size, Single
          - Multipack: multiple units sold together e.g. "6 pack", "2x", "box of 12".
@@ -683,7 +700,7 @@ __END__
 <!DOCTYPE html>
 <html>
 <head>
-  <title>TGTG AI Hunter v4.2</title>
+  <title>TGTG AI Hunter v4.3</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; padding: 20px; color: #333; }
     .container { max-width: 98%; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -724,16 +741,16 @@ __END__
     .ai-note { font-size: 10px; color: #888; margin-bottom: 5px; font-style: italic; }
 
     .tag { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin: 1px; }
-    .tag-diet    { background: #d4edda; color: #155724; }
-    .tag-format  { background: #cce5ff; color: #004085; }
-    .tag-occasion{ background: #fff3cd; color: #856404; }
+    .tag-diet     { background: #d4edda; color: #155724; }
+    .tag-format   { background: #cce5ff; color: #004085; }
+    .tag-occasion { background: #fff3cd; color: #856404; }
   </style>
 </head>
 <body>
 
 <div class="container">
   <div style="display:flex; justify-content:space-between; align-items:center;">
-    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v4.2</span></h1>
+    <h1>✨ TGTG AI Hunter <span style="font-size:0.5em; color:#666; font-weight:normal;">v4.3</span></h1>
     <span id="progressIndicator" style="font-weight:bold; color:#00816A;"></span>
   </div>
 
