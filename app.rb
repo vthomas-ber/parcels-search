@@ -21,6 +21,9 @@ BAD_URL_PATTERNS = %w[
   scribd academia tamu.edu github trinket joybuy momogo
   onlinelibrary.wiley pubs.acs.org springer.com sciencedirect ncbi.nlm
   pubmed nature.com cell.com beslist ocen-piwo dunnesstoresgrocery
+  unesdoc.unesco fitia.app
+  world.openfoodfacts.org fr.openfoodfacts.org de.openfoodfacts.org
+  nl.openfoodfacts.org es.openfoodfacts.org it.openfoodfacts.org
 ].freeze
 
 ALLOWED_KEYS = %w[
@@ -614,23 +617,23 @@ class MasterDataHunter
     }
 
     @goldmine_sites = {
-      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:openfoodfacts.org",
-      "UK" => "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:tesco.com OR site:openfoodfacts.org",
-      "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:openfoodfacts.org",
-      "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be OR site:openfoodfacts.org",
-      "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:dm.de OR site:rossmann.de OR site:openfoodfacts.org",
-      "AT" => "site:billa.at OR site:spar.at OR site:gurkerl.at OR site:hofer.at OR site:openfoodfacts.org",
-      "DK" => "site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk OR site:openfoodfacts.org",
-      "IT" => "site:carrefour.it OR site:conad.it OR site:coop.it OR site:openfoodfacts.org",
-      "ES" => "site:carrefour.es OR site:mercadona.es OR site:dia.es OR site:openfoodfacts.org",
-      "SE" => "site:ica.se OR site:coop.se OR site:willys.se OR site:openfoodfacts.org",
-      "NO" => "site:oda.com OR site:meny.no OR site:holdbart.no OR site:openfoodfacts.org",
-      "FI" => "site:k-ruoka.fi OR site:s-kaupat.fi OR site:openfoodfacts.org",
-      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl OR site:openfoodfacts.org"
+      "FR" => "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com",
+      "UK" => "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:tesco.com",
+      "NL" => "site:ah.nl OR site:jumbo.com OR site:plus.nl",
+      "BE" => "site:delhaize.be OR site:colruyt.be OR site:carrefour.be",
+      "DE" => "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:dm.de OR site:rossmann.de",
+      "AT" => "site:billa.at OR site:spar.at OR site:gurkerl.at OR site:hofer.at",
+      "DK" => "site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk",
+      "IT" => "site:carrefour.it OR site:conad.it OR site:coop.it",
+      "ES" => "site:carrefour.es OR site:mercadona.es OR site:dia.es",
+      "SE" => "site:ica.se OR site:coop.se OR site:willys.se",
+      "NO" => "site:oda.com OR site:meny.no OR site:holdbart.no",
+      "FI" => "site:k-ruoka.fi OR site:s-kaupat.fi",
+      "PL" => "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl"
     }
     global_sites = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
     @goldmine_sites.each { |m, s| @goldmine_sites[m] = "#{s} OR #{global_sites}" }
-    @goldmine_sites.default = "site:openfoodfacts.org OR #{global_sites}"
+    @goldmine_sites.default = global_sites
   end
 
   def process_product(gtin, market)
@@ -661,11 +664,11 @@ class MasterDataHunter
 
     threads << Thread.new { off_text = fetch_openfoodfacts(gtin) }
 
-    image_results = [nil, nil, nil]
+    image_results = [nil, nil]
     image_thread = Thread.new { image_results = find_three_images(gtin, market, official_data) }
 
-    deadline = Time.now + 30
-    image_deadline = Time.now + 22
+    deadline = Time.now + 45
+    image_deadline = Time.now + 30
     image_thread.join([image_deadline - Time.now, 0.5].max) if image_thread.alive?
     threads.each { |t| t.join([deadline - Time.now, 0.1].max) }
     (threads + [image_thread]).each { |t| t.kill if t.alive? }
@@ -763,7 +766,7 @@ class MasterDataHunter
       end
     end
 
-    # Build display images — 3 separate base64 or URL references
+    # Build display images — 2 images: pack shot + single product
     display_images = image_results.map do |img|
       next nil unless img
       if img[:base64] && img[:mime]
@@ -791,7 +794,6 @@ class MasterDataHunter
       found: true, gtin: gtin, status: status, market: market,
       image_url:  display_images[0],
       image_url2: display_images[1],
-      image_url3: display_images[2],
       issuing_country: official_data ? official_data['issuingCountry'] : nil,
       defined_sources: confirmed_sources.uniq { |s| s[:url] }
     }.merge(ai_hash)
@@ -913,67 +915,87 @@ class MasterDataHunter
   end
 
   # THREE IMAGES: pack shot, lifestyle/serving, nutrition label
+  # Returns [image1, image2] — pack shot + single product
+  # Strategy: 1 SerpAPI image search → grab source page → scrape all product images from it
   def find_three_images(gtin, market, official_data)
-    return [nil, nil, nil] if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
+    return [nil, nil] if SERPAPI_KEY.nil? || SERPAPI_KEY.empty?
     gl = market == "UK" ? "gb" : market.downcase
     hl = @hl_codes[market] || "en"
-    country_name = @country_names[market] || ""
     results = []
 
-    # Image 1: Registry image first if available
+    # Image 1: Registry image — fastest and most reliable, always correct product
     if official_data && is_good_image_size?(official_data['image'])
       encoded = download_and_encode(official_data['image'], "https://www.ean-search.org/?q=#{gtin}")
       results << encoded if encoded
     end
 
-    product_name = official_data ? official_data['name'].to_s.gsub(/[^a-zA-Z0-9\s]/, '').strip : ""
+    # Single SerpAPI image search — GTIN is the most reliable query
+    source_page_url = nil
+    direct_image_urls = []
 
-    # Three different searches targeting different image types
-    searches = [
-      "\"#{gtin}\" #{country_name}",        # Pack shot — exact GTIN
-      "\"#{gtin}\"",                         # Pack shot — global
-      product_name.length > 3 ? "#{product_name} product" : "\"#{gtin}\" product",  # Lifestyle
-      product_name.length > 3 ? "#{product_name} nutrition label" : "\"#{gtin}\" label"  # Label
-    ]
+    begin
+      res = Timeout.timeout(12) {
+        GoogleSearch.new(
+          q: "\"#{gtin}\"",
+          tbm: "isch", gl: gl, hl: hl,
+          api_key: SERPAPI_KEY
+        ).get_hash
+      }
+      images = res[:images_results] || []
 
-    collected_urls = []
+      images.first(10).each do |img|
+        url = img[:original]
+        page = img[:link]
+        next if url.nil? || url.include?("placeholder")
+        next if %w[pinterest ebay tiktok facebook instagram openfoodfacts].any? { |b| url.include?(b) }
 
-    searches.each do |query|
-      break if collected_urls.length >= 9
-      begin
-        res = Timeout.timeout(10) {
-          GoogleSearch.new(q: query, tbm: "isch", gl: gl, hl: hl, api_key: SERPAPI_KEY).get_hash
-        }
-        (res[:images_results] || []).first(8).each do |img|
-          url = img[:original]
-          next if url.nil? || url.include?("placeholder")
-          next if %w[pinterest ebay openfoodfacts tiktok facebook instagram].any? { |b| url.include?(b) }
-          collected_urls << url unless collected_urls.include?(url)
+        direct_image_urls << url
+        # Capture the first clean source page for deep scraping
+        if source_page_url.nil? && page && !%w[pinterest ebay tiktok facebook instagram].any? { |b| page.include?(b) }
+          source_page_url = page
         end
-      rescue => e; log("IMG search error: #{e.message}") end
+      end
+    rescue => e
+      log("IMG search error: #{e.message}")
     end
 
-    # Also try barcodelookup for reliable pack shots
-    begin
-      res = Timeout.timeout(10) {
-        GoogleSearch.new(q: "site:barcodelookup.com OR site:go-upc.com \"#{gtin}\"", tbm: "isch", gl: gl, hl: hl, api_key: SERPAPI_KEY).get_hash
-      }
-      (res[:images_results] || []).first(5).each do |img|
-        url = img[:original]
-        collected_urls.unshift(url) if url && !collected_urls.include?(url)
-      end
-    rescue => e; log("Barcode img error: #{e.message}") end
+    # Try to scrape the source page to get all product images from same listing
+    source_images = []
+    if source_page_url && results.length < 2
+      begin
+        agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        resp = Timeout.timeout(8) { HTTParty.get(source_page_url, headers: { "User-Agent" => agent }, timeout: 7) }
 
-    # Download up to 3 valid images
-    collected_urls.each do |url|
-      break if results.length >= 3
+        if resp&.code == 200
+          doc = Nokogiri::HTML(resp.body)
+          # Find all img tags with meaningful src — product images are typically large
+          doc.css('img[src]').each do |img_tag|
+            src = img_tag['src'] || img_tag['data-src'] || img_tag['data-lazy-src']
+            next unless src
+            src = URI.join(source_page_url, src).to_s rescue src
+            next if src.include?("logo") || src.include?("icon") || src.include?("banner")
+            next if %w[pinterest ebay tiktok facebook instagram openfoodfacts placeholder].any? { |b| src.include?(b) }
+            source_images << src unless source_images.include?(src)
+          end
+          log("IMG source page scraped #{source_images.length} candidates from #{source_page_url}")
+        end
+      rescue => e
+        log("IMG source page scrape error: #{e.message}")
+      end
+    end
+
+    # Combine: source page images first (same product, multiple angles), then direct search results
+    candidate_urls = (source_images + direct_image_urls).uniq.reject { |u| results.any? { |r| r && r[:url] == u } }
+
+    candidate_urls.each do |url|
+      break if results.length >= 2
       next unless is_good_image_size?(url)
-      encoded = download_and_encode(url, nil)
+      encoded = download_and_encode(url, source_page_url)
       results << encoded if encoded
     end
 
-    # Pad to 3 with nils
-    results + [nil] * (3 - results.length)
+    # Pad to 2
+    results + [nil] * (2 - results.length)
   end
 
   def is_good_image_size?(url)
@@ -1020,7 +1042,8 @@ class MasterDataHunter
         begin
           sleep(idx * 0.2)
           agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-          resp = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 8)
+          resp = HTTParty.get(url, headers: { "User-Agent" => agent }, timeout: 12)
+
           body = resp.body.to_s
 
           is_blocked  = [400, 403, 429, 503].include?(resp.code)
@@ -1032,7 +1055,7 @@ class MasterDataHunter
 
           if (is_blocked || is_js_shell) && ZENROWS_API_KEY && !ZENROWS_API_KEY.empty?
             log("ZenRows escalation: #{url} (#{resp.code})")
-            resp = HTTParty.get("https://api.zenrows.com/v1/", timeout: 15, query: {
+            resp = HTTParty.get("https://api.zenrows.com/v1/", timeout: 20, query: {
               apikey: ZENROWS_API_KEY, url: url,
               js_render: 'true', antibot: 'true', premium_proxy: 'true', wait: '2000',
               css_extractor: '{"ingredients":".pdp-description-reviews__product-details-col-2","nutrition":".nutritionTable,.pdp-nutrition-table"}'
@@ -1060,7 +1083,7 @@ class MasterDataHunter
       end
     end
 
-    threads.each { |t| t.join(18) }
+    threads.each { |t| t.join(25) }
     valid_urls, texts = [], []
     threads.each { |t| if t[:valid]; valid_urls << t[:valid]; texts << t[:text]; end }
     { text: texts.join("\n"), valid_urls: valid_urls }
@@ -1180,7 +1203,7 @@ class MasterDataHunter
   end
 
   def empty_result(gtin, market, msg, img)
-    { found: false, status: msg, gtin: gtin, market: market, image_url: img, image_url2: nil, image_url3: nil, defined_sources: [] }
+    { found: false, status: msg, gtin: gtin, market: market, image_url: img, image_url2: nil, defined_sources: [] }
   end
 end
 
@@ -1360,7 +1383,7 @@ function renderRow(tr,gtin,d){
   if(d.status?.includes('Deep'))sc='st-deep';
   if(d.status?.includes('Error')||d.status?.includes('Missing')||d.status?.includes('Blind'))sc='st-miss';
 
-  const imgs=[d.image_url,d.image_url2,d.image_url3].filter(Boolean);
+  const imgs=[d.image_url,d.image_url2].filter(Boolean);
   const imgHTML=imgs.length?`<div class="imgs">${imgs.map(u=>`<a href="${u}" target="_blank"><img src="${u}" class="img-thumb" onerror="this.style.display='none'"></a>`).join('')}</div>`:'-';
 
   let src=`<div class="source-list">`;
